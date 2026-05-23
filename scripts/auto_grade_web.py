@@ -24,6 +24,7 @@ MINERU_DIR = ROOT / "tmp" / "mineru_grading"
 UPLOAD_DIR = ROOT / "tmp" / "uploads"
 OUTPUT_DIR = ROOT / "output" / "auto_grading"
 DEFAULT_POLICY_PATH = ROOT / "config" / "kaoyan_math_grading_policy.md"
+UPLOAD_ROLES = {"submission", "question_paper", "reference"}
 
 
 TASKS: dict[str, "TaskState"] = {}
@@ -80,21 +81,83 @@ def read_request_json(handler: BaseHTTPRequestHandler) -> dict:
     return payload
 
 
-def list_pdf_files() -> list[dict[str, str]]:
+def path_role(path: Path) -> str:
+    resolved = path.resolve()
+    for role in sorted(UPLOAD_ROLES):
+        try:
+            resolved.relative_to((UPLOAD_DIR / role).resolve())
+            return role
+        except ValueError:
+            continue
+    try:
+        resolved.relative_to(MINERU_DIR.resolve())
+        return "mineru"
+    except ValueError:
+        return "other"
+
+
+def is_deletable_upload_pdf(path: Path) -> bool:
+    try:
+        resolved = path.resolve()
+        resolved.relative_to(UPLOAD_DIR.resolve())
+    except ValueError:
+        return False
+    return resolved.is_file() and resolved.suffix.lower() == ".pdf"
+
+
+def file_row(path: Path) -> dict[str, object]:
+    stat = path.stat()
+    group = str(path.parent.relative_to(ROOT)) if path.parent.is_relative_to(ROOT) else str(path.parent)
+    return {
+        "name": path.name,
+        "path": str(path),
+        "group": group,
+        "role": path_role(path),
+        "deletable": is_deletable_upload_pdf(path),
+        "size_bytes": stat.st_size,
+        "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(stat.st_mtime)),
+        "mtime_ts": stat.st_mtime,
+    }
+
+
+def list_pdf_files() -> list[dict[str, object]]:
     roots = [UPLOAD_DIR, MINERU_DIR, *extra_search_dirs()]
-    rows: list[dict[str, str]] = []
+    rows: list[dict[str, object]] = []
     for base in roots:
         if not base.exists():
             continue
         for path in sorted(base.rglob("*.pdf")):
-            rows.append(
-                {
-                    "name": path.name,
-                    "path": str(path),
-                    "group": str(path.parent.relative_to(ROOT)) if path.parent.is_relative_to(ROOT) else str(path.parent),
-                }
-            )
-    return rows
+            rows.append(file_row(path))
+    return sorted(rows, key=lambda row: float(row.get("mtime_ts", 0)), reverse=True)
+
+
+def delete_uploaded_pdfs(paths: list[str]) -> dict[str, object]:
+    deleted: list[dict[str, str]] = []
+    skipped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in paths:
+        path_text = str(raw or "").strip()
+        if not path_text:
+            continue
+        try:
+            path = Path(path_text).expanduser()
+            if not path.is_absolute():
+                path = (ROOT / path).resolve()
+            else:
+                path = path.resolve()
+            key = str(path).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if not is_deletable_upload_pdf(path):
+                skipped.append({"path": str(path), "reason": "只能删除项目 tmp/uploads 内的 PDF 副本"})
+                continue
+            name = path.name
+            path.unlink()
+            deleted.append({"path": str(path), "name": name})
+        except Exception as exc:  # noqa: BLE001
+            skipped.append({"path": path_text, "reason": f"{type(exc).__name__}: {exc}"})
+    return {"deleted": deleted, "skipped": skipped, "pdf_files": list_pdf_files()}
 
 
 def extra_search_dirs() -> list[Path]:
@@ -113,8 +176,8 @@ def safe_upload_filename(raw_name: str) -> str:
     return f"{stem or 'uploaded'}{suffix}"
 
 
-def save_uploaded_pdfs(handler: BaseHTTPRequestHandler, role: str) -> list[dict[str, str]]:
-    if role not in {"submission", "question_paper", "reference"}:
+def save_uploaded_pdfs(handler: BaseHTTPRequestHandler, role: str) -> list[dict[str, object]]:
+    if role not in UPLOAD_ROLES:
         raise ValueError("bad upload role")
     content_type = handler.headers.get("Content-Type", "")
     match = re.search(r"boundary=(?P<boundary>[^;]+)", content_type)
@@ -128,7 +191,7 @@ def save_uploaded_pdfs(handler: BaseHTTPRequestHandler, role: str) -> list[dict[
         raise ValueError("PDF 超过 80MB，请先压缩或拆分")
     raw = handler.rfile.read(length)
     marker = b"--" + boundary
-    uploaded: list[dict[str, str]] = []
+    uploaded: list[dict[str, object]] = []
     for part in raw.split(marker):
         if b"filename=" not in part:
             continue
@@ -145,14 +208,7 @@ def save_uploaded_pdfs(handler: BaseHTTPRequestHandler, role: str) -> list[dict[
         target_name = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}_{safe_upload_filename(filename)}"
         target = role_dir / target_name
         target.write_bytes(body)
-        uploaded.append(
-            {
-                "name": target.name,
-                "path": str(target),
-                "group": str(role_dir.relative_to(ROOT)),
-                "role": role,
-            }
-        )
+        uploaded.append(file_row(target))
     if not uploaded:
         raise ValueError("未找到上传的 PDF 文件")
     return uploaded
@@ -716,6 +772,14 @@ class Handler(BaseHTTPRequestHandler):
                 uploaded = save_uploaded_pdfs(self, role)
                 json_response(self, {"ok": True, "files": uploaded, "file": uploaded[0], "pdf_files": list_pdf_files()})
                 return
+            if parsed.path == "/api/delete-files":
+                payload = read_request_json(self)
+                raw_paths = payload.get("paths") or []
+                if not isinstance(raw_paths, list):
+                    raise ValueError("paths must be a list")
+                result = delete_uploaded_pdfs([str(item) for item in raw_paths])
+                json_response(self, {"ok": True, **result})
+                return
             if parsed.path != "/api/grade":
                 text_response(self, "Not found", status=404)
                 return
@@ -816,6 +880,38 @@ INDEX_HTML = r"""<!doctype html>
       grid-template-columns: minmax(0, 1fr) auto;
       gap: 8px;
       align-items: center;
+    }
+    .file-manager {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      margin-top: 8px;
+      background: #fbfcfd;
+    }
+    .file-manager select {
+      min-height: 90px;
+      background: #fff;
+    }
+    .file-manager.single select {
+      min-height: 78px;
+    }
+    .file-tools {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 8px;
+    }
+    .file-tools button {
+      padding: 7px 10px;
+      min-height: 32px;
+    }
+    .file-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      margin-top: 6px;
     }
     input[type="file"] {
       padding: 8px;
@@ -944,20 +1040,49 @@ INDEX_HTML = r"""<!doctype html>
         <input id="submissionUpload" type="file" accept="application/pdf,.pdf" multiple />
         <button class="secondary" data-upload-role="submission">批量导入</button>
       </div>
-      <select id="submissionPdf" multiple size="4"></select>
+      <div class="file-manager">
+        <select id="submissionPdf" multiple size="6"></select>
+        <div class="file-meta">
+          <span id="submissionCount">尚未导入学生答卷</span>
+          <span>多选后按顺序批改</span>
+        </div>
+        <div class="file-tools">
+          <button class="secondary" data-select-all="submissionPdf">全选学生卷</button>
+          <button class="secondary" data-clear-select="submissionPdf">清空选择</button>
+          <button class="danger" data-delete-select="submissionPdf">删除所选</button>
+        </div>
+      </div>
       <label for="questionPaperPdf">试卷题目 PDF</label>
       <div class="file-row">
         <input id="questionPaperUpload" type="file" accept="application/pdf,.pdf" />
         <button class="secondary" data-upload-role="question_paper">导入</button>
       </div>
-      <select id="questionPaperPdf"></select>
+      <div class="file-manager single">
+        <select id="questionPaperPdf" size="3"></select>
+        <div class="file-meta">
+          <span id="questionPaperCount">尚未导入试卷题目</span>
+          <span>当前选中即为本次题目 PDF</span>
+        </div>
+        <div class="file-tools">
+          <button class="danger" data-delete-current="questionPaperPdf">删除当前题目</button>
+        </div>
+      </div>
       <label for="referencePdf">参考答案 / 评分依据 PDF</label>
       <div class="file-row">
         <input id="referenceUpload" type="file" accept="application/pdf,.pdf" />
         <button class="secondary" data-upload-role="reference">导入</button>
       </div>
-      <select id="referencePdf"></select>
-      <div class="hint" id="uploadHint">学生答卷可一次多选并批量导入；下方学生卷列表可按 Ctrl/Shift 多选，程序会按所选学生卷一张一张改。题目和答案各导入一份 PDF。</div>
+      <div class="file-manager single">
+        <select id="referencePdf" size="3"></select>
+        <div class="file-meta">
+          <span id="referenceCount">尚未导入参考答案</span>
+          <span>当前选中即为本次评分依据</span>
+        </div>
+        <div class="file-tools">
+          <button class="danger" data-delete-current="referencePdf">删除当前答案</button>
+        </div>
+      </div>
+      <div class="hint" id="uploadHint">学生答卷可一次多选批量导入；删除按钮只删除项目临时副本，不会删除微信或磁盘中的原始 PDF。</div>
       <div class="row">
         <div>
           <label for="questions">题号</label>
@@ -1137,25 +1262,71 @@ INDEX_HTML = r"""<!doctype html>
       const data = await api("/api/files");
       $("rootHint").textContent = "项目目录：" + data.root;
       $("policyPath").value = data.default_policy_path || "";
-      fillSelect($("submissionPdf"), data.pdf_files || [], "2702124-数学-复旦大学.pdf");
-      fillSelect($("questionPaperPdf"), data.pdf_files || [], "五月数学模考(3).pdf");
-      fillSelect($("referencePdf"), data.pdf_files || [], "五月数学模考答案(1).pdf");
+      const files = data.pdf_files || [];
+      fillRoleSelect($("submissionPdf"), files, "submission", "2702124-数学-复旦大学.pdf", "submissionCount", "学生答卷");
+      fillRoleSelect($("questionPaperPdf"), files, "question_paper", "五月数学模考(3).pdf", "questionPaperCount", "试卷题目");
+      fillRoleSelect($("referencePdf"), files, "reference", "五月数学模考答案(1).pdf", "referenceCount", "参考答案");
       await loadRuns();
     }
 
-    function fillSelect(select, files, preferredName) {
+    function fillRoleSelect(select, files, role, preferredName, countId, label) {
+      select.dataset.countId = countId;
+      select.dataset.fileLabel = label;
       const oldValues = selectedValues(select);
       const old = select.value;
       select.innerHTML = "";
-      for (const file of files) {
+      const roleFiles = files.filter(file => file.role === role);
+      for (const file of roleFiles) {
         const option = document.createElement("option");
         option.value = file.path;
-        option.textContent = `[${file.group}] ${file.name}`;
+        option.textContent = `${file.name} · ${formatSize(file.size_bytes)} · ${file.mtime || ""}`;
+        option.dataset.deletable = file.deletable ? "1" : "0";
+        option.dataset.group = file.group || "";
         select.appendChild(option);
         if (file.name === preferredName) option.selected = true;
       }
-      if (select.multiple && oldValues.length) selectValues(select, oldValues);
-      else if (old) select.value = old;
+      if (select.multiple && oldValues.length) {
+        selectValues(select, oldValues);
+      } else if (old) {
+        select.value = old;
+      }
+      if (!select.multiple && !select.value && select.options.length) {
+        select.selectedIndex = 0;
+      }
+      const selectedCount = selectedValues(select).length;
+      $(countId).textContent = select.multiple
+        ? `${label} ${roleFiles.length} 份，已选 ${selectedCount} 份`
+        : `${label} ${roleFiles.length} 份${select.value ? "，已选 1 份" : ""}`;
+      if (!roleFiles.length) {
+        const option = document.createElement("option");
+        option.value = "";
+        option.textContent = `尚未导入${label} PDF`;
+        option.disabled = true;
+        select.appendChild(option);
+      }
+      refreshFileCount(select);
+    }
+
+    function refreshFileCount(select) {
+      const countId = select.dataset.countId;
+      if (!countId) return;
+      const label = select.dataset.fileLabel || "PDF";
+      const total = Array.from(select.options).filter(option => option.value).length;
+      const selectedCount = selectedValues(select).length;
+      if (!total) {
+        $(countId).textContent = `尚未导入${label}`;
+      } else if (select.multiple) {
+        $(countId).textContent = `${label} ${total} 份，已选 ${selectedCount} 份`;
+      } else {
+        $(countId).textContent = `${label} ${total} 份${selectedCount ? "，已选 1 份" : ""}`;
+      }
+    }
+
+    function formatSize(bytes) {
+      const value = Number(bytes || 0);
+      if (value >= 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)}MB`;
+      if (value >= 1024) return `${Math.round(value / 1024)}KB`;
+      return `${value}B`;
     }
 
     async function uploadPdf(role) {
@@ -1182,11 +1353,31 @@ INDEX_HTML = r"""<!doctype html>
       const uploadedFiles = data.files || (data.file ? [data.file] : []);
       if (role === "submission") {
         selectValues($(cfg.select), uploadedFiles.map(file => file.path));
+        refreshFileCount($(cfg.select));
       } else if (uploadedFiles[0]) {
         selectValue($(cfg.select), uploadedFiles[0].path);
+        refreshFileCount($(cfg.select));
       }
       $("uploadHint").textContent = `已导入 ${uploadedFiles.length} 个 PDF，可以继续选择其他 PDF 或开始阅卷。`;
       fileInput.value = "";
+    }
+
+    async function deleteSelectedFiles(selectId, onlyCurrent) {
+      const select = $(selectId);
+      const paths = onlyCurrent ? [select.value].filter(Boolean) : selectedValues(select);
+      if (!paths.length) throw new Error("请先选择要删除的 PDF");
+      const label = select.dataset.fileLabel || "PDF";
+      const message = `确定删除 ${paths.length} 份${label}的项目临时副本吗？\n\n不会删除微信或磁盘中的原始文件。`;
+      if (!confirm(message)) return;
+      const data = await api("/api/delete-files", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({paths})
+      });
+      await loadFiles();
+      const deleted = data.deleted || [];
+      const skipped = data.skipped || [];
+      $("uploadHint").textContent = `已删除 ${deleted.length} 份临时 PDF${skipped.length ? `，${skipped.length} 份未删除：${skipped[0].reason}` : "。"} `;
     }
 
     async function loadRuns() {
@@ -1436,6 +1627,37 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelector('[data-tab="audit"]').click();
     });
     $("refreshBtn").onclick = () => loadFiles().catch(err => alert(err));
+    ["submissionPdf", "questionPaperPdf", "referencePdf"].forEach(id => {
+      $(id).onchange = () => refreshFileCount($(id));
+    });
+    document.querySelectorAll("[data-select-all]").forEach(btn => {
+      btn.onclick = () => {
+        const select = $(btn.dataset.selectAll);
+        for (const option of select.options) {
+          if (option.value) option.selected = true;
+        }
+        refreshFileCount(select);
+      };
+    });
+    document.querySelectorAll("[data-clear-select]").forEach(btn => {
+      btn.onclick = () => {
+        const select = $(btn.dataset.clearSelect);
+        for (const option of select.options) option.selected = false;
+        refreshFileCount(select);
+      };
+    });
+    document.querySelectorAll("[data-delete-select]").forEach(btn => {
+      btn.onclick = () => deleteSelectedFiles(btn.dataset.deleteSelect, false).catch(err => {
+        $("uploadHint").textContent = String(err);
+        alert(err);
+      });
+    });
+    document.querySelectorAll("[data-delete-current]").forEach(btn => {
+      btn.onclick = () => deleteSelectedFiles(btn.dataset.deleteCurrent, true).catch(err => {
+        $("uploadHint").textContent = String(err);
+        alert(err);
+      });
+    });
     document.querySelectorAll("[data-upload-role]").forEach(btn => {
       btn.onclick = () => uploadPdf(btn.dataset.uploadRole).catch(err => {
         $("uploadHint").textContent = String(err);
