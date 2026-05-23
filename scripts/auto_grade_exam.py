@@ -7,6 +7,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -36,7 +37,7 @@ DEFAULT_VISUAL_FOCUS_DIR = ROOT / "tmp" / "auto_grading_visual_focus"
 DEFAULT_POLICY_PATH = ROOT / "config" / "kaoyan_math_grading_policy.md"
 DEFAULT_CACHE_DIR = DEFAULT_OUTPUT_DIR / "cache"
 DEFAULT_RESULT_CACHE_DIR = DEFAULT_OUTPUT_DIR / "question_result_cache"
-QUESTION_RESULT_CACHE_VERSION = "2026-05-23-strict-solution-v2"
+QUESTION_RESULT_CACHE_VERSION = "2026-05-23-strict-solution-v3-discrete-scores"
 LOG_LOCK = threading.Lock()
 CACHE_LOCK = threading.Lock()
 RESULT_CACHE_LOCK = threading.Lock()
@@ -2158,7 +2159,8 @@ def build_grade_messages(
             "First create a point-by-point checklist with status seen/missing/wrong/unclear. Score only from seen-and-correct points. "
             "If any core scoring point is missing, the score should normally be below 80%; if any core setup/model/region/distribution/matrix point is wrong, it should normally be below 70%. "
             "If giving more than 80% credit, valid_student_steps/main_earned_points must show a complete core reasoning chain. "
-            "If a score is capped because evidence is incomplete, state the cap reason in main_deducted_points."
+            "If a score is capped because evidence is incomplete, state the cap reason in main_deducted_points. "
+            "Return executable exam scores, not fuzzy averages: solution-question scores must be integer points only; when unsure between two adjacent scores, choose the lower one."
         ),
         "required_output_schema": {
             "question_no": "string",
@@ -2187,6 +2189,7 @@ def build_grade_messages(
             "max_reason_chars": 160,
             "style": "Concise Chinese. Do not repeat the same point in several fields.",
             "solution_question_style": "Strict. Name missing inferred scoring points explicitly; do not give comfort points for unwritten reasoning.",
+            "score_granularity": "objective: 0/full score; blank: integer score; solution: integer score only, prefer lower adjacent score when evidence is incomplete.",
         },
     }
     if visual_payload and "stable_pages" in visual_payload:
@@ -2572,7 +2575,8 @@ def build_arbitration_messages(
             "Only applies to solution questions. Re-score from evidence, not from the average of the first two scores. "
             "Prefer the lower score if the higher score depends on unwritten reasoning, missing key derivation, or unverified conditions. "
             "If both prior rounds overlooked a missing boundary/domain/distribution/likelihood/matrix/proof condition, correct it and cap the score. "
-            "Use a point-by-point checklist and do not exceed 80% when a core scoring point is missing."
+            "Use a point-by-point checklist and do not exceed 80% when a core scoring point is missing. "
+            "Return integer solution-question scores only; when the previous average is fractional, convert it to the lower justified integer unless arbitration evidence clearly supports the higher integer."
         ),
         "round_1": first,
         "round_2": second,
@@ -2603,6 +2607,7 @@ def build_arbitration_messages(
             "max_chars_per_list_item": 80,
             "max_reason_chars": 180,
             "style": "Concise Chinese. Focus only on score-changing differences.",
+            "score_granularity": "solution: integer score only; no scores like 7.8, 9.36, or 6.5.",
         },
     }
     user_parts: list[dict[str, Any]] = []
@@ -3192,6 +3197,43 @@ def apply_strict_solution_caps(result: dict[str, Any], item: AnswerItem) -> None
     result["reason"] = truncate_str((str(result.get("reason") or "") + " " + cap_reason).strip(), 260)
 
 
+def normalize_final_score(score: Any, item: AnswerItem) -> float | None:
+    if score is None:
+        return None
+    try:
+        value = float(score)
+    except (TypeError, ValueError):
+        return None
+    value = max(0.0, min(float(item.full_score), value))
+    if item.question_type == "objective":
+        return float(item.full_score) if value >= float(item.full_score) * 0.999 else 0.0
+    if item.question_type == "blank":
+        return float(item.full_score) if value >= float(item.full_score) * 0.999 else 0.0
+    if item.question_type == "solution":
+        return float(math.floor(value + 1e-9))
+    return round(value, 2)
+
+
+def normalize_result_final_score(result: dict[str, Any], item: AnswerItem) -> dict[str, Any]:
+    raw_score = result.get("final_score")
+    normalized = normalize_final_score(raw_score, item)
+    if raw_score is not None and normalized is not None and abs(float(raw_score) - normalized) > 1e-9:
+        result["raw_final_score_before_discrete_rounding"] = round(float(raw_score), 4)
+        result["score_discretization_policy"] = (
+            "解答题按严格考研阅卷口径向下收为整数分；不使用 7.8、9.36、6.5 等碎小数。"
+            if item.question_type == "solution"
+            else "客观/填空题按题型规则收为可执行分值，不保留碎小数。"
+        )
+        if item.question_type == "solution":
+            result["main_deducted_points"] = limit_list(
+                ensure_list(result.get("main_deducted_points")) + ["最终分按严格阅卷口径向下收整，避免模型平均分产生虚高小数。"],
+                max_items=4,
+                max_chars=180,
+            )
+    result["final_score"] = normalized
+    return result
+
+
 def normalize_strict_checklist(value: Any) -> list[dict[str, str]]:
     if not isinstance(value, list):
         return []
@@ -3631,7 +3673,7 @@ def grade_question(
 def combine_single_grade(item: AnswerItem, first: dict[str, Any]) -> dict[str, Any]:
     score = first.get("score")
     ocr_resolved = round_resolves_ocr_issue(first, item)
-    return {
+    result = {
         "question_no": item.question_no,
         "question_type": item.question_type,
         "full_score": item.full_score,
@@ -3650,6 +3692,7 @@ def combine_single_grade(item: AnswerItem, first: dict[str, Any]) -> dict[str, A
         "wrong_or_missing_steps": merge_lists(first.get("wrong_or_missing_steps")),
         "strict_scoring_checklist": first.get("strict_scoring_checklist") or [],
     }
+    return normalize_result_final_score(result, item)
 
 
 def should_retry_with_focused_visual(result: dict[str, Any], visual_payload: dict[str, Any] | None) -> bool:
@@ -3909,7 +3952,7 @@ def combine_grades(
         ocr_resolved = round_resolves_ocr_issue(first, item) or round_resolves_ocr_issue(second, item)
         base["needs_human_review"] = bool(first.get("needs_human_review") or second.get("needs_human_review") or (item.needs_ocr_review and not ocr_resolved))
         base["review_reason"] = first.get("review_reason") or second.get("review_reason")
-        return base
+        return normalize_result_final_score(base, item)
     else:
         base["third_arbitration_triggered"] = True
         if third is None:
@@ -3947,7 +3990,7 @@ def combine_grades(
     base["valid_student_steps"] = merge_lists(base["valid_student_steps"], third.get("valid_student_steps"))
     base["wrong_or_missing_steps"] = merge_lists(base["wrong_or_missing_steps"], third.get("wrong_or_missing_steps"))
     base["strict_scoring_checklist"] = merge_checklists(base.get("strict_scoring_checklist"), third.get("strict_scoring_checklist"))
-    return base
+    return normalize_result_final_score(base, item)
 
 
 def merge_checklists(*values: Any) -> list[dict[str, str]]:

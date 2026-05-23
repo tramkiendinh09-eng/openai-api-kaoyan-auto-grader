@@ -575,7 +575,7 @@ def load_audit_tail(run_id: str) -> dict:
     path = OUTPUT_DIR / run_id / "audit_log.jsonl"
     if not path.exists():
         return {"available": False, "path": str(path), "events": []}
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-40:]
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-240:]
     events = []
     for line in lines:
         try:
@@ -591,12 +591,19 @@ def audit_progress(events: list[dict]) -> dict:
     latest_event = None
     latest_elapsed = None
     latest_error = None
+    layout_scan_status = "整卷 xhigh 视觉定位：尚未看到日志"
     completed_calls = 0
     active_calls = 0
     for event in events:
         if not isinstance(event, dict):
             continue
         name = event.get("event")
+        if name == "answer_layout_scan_started":
+            layout_scan_status = "整卷 xhigh 视觉定位：已发起"
+        elif name == "answer_layout_scan_finished":
+            layout_scan_status = f"整卷 xhigh 视觉定位：已完成，定位 {event.get('located_question_count', 0)} 题"
+        elif name == "answer_layout_scan_failed":
+            layout_scan_status = "整卷 xhigh 视觉定位：失败，已改用页码启发式"
         if name in {"visual_evidence_attached", "local_objective_grade"} and event.get("question_no"):
             latest_question = str(event.get("question_no"))
             latest_round = "准备视觉阅卷" if name == "visual_evidence_attached" else "本地客观题判分"
@@ -684,6 +691,7 @@ def audit_progress(events: list[dict]) -> dict:
         "latest_question": latest_question,
         "latest_round": latest_round,
         "latest_event": latest_event,
+        "layout_scan_status": layout_scan_status,
         "latest_elapsed_seconds": latest_elapsed,
         "latest_error": latest_error,
         "completed_model_calls": completed_calls,
@@ -1205,7 +1213,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="metric"><strong id="reviewCount">-</strong><span>需复核</span></div>
         <div class="metric"><strong id="arbCount">-</strong><span>仲裁次数</span></div>
       </div>
-      <div id="progressBox" class="hint">等待任务开始</div>
+      <div id="progressBox" class="hint">整卷 xhigh 视觉定位：等待开始。等待任务开始</div>
       <div id="summary"></div>
       <div class="tabs">
         <button class="active" data-tab="table">得分表</button>
@@ -1518,7 +1526,7 @@ INDEX_HTML = r"""<!doctype html>
     function renderReport(report) {
       $("jsonPanel").textContent = JSON.stringify(report, null, 2);
       const summary = report.score_summary || {};
-      $("totalScore").textContent = summary.total_score_for_graded_questions ?? "-";
+      $("totalScore").textContent = formatScore(summary.total_score_for_graded_questions);
       const graded = summary.graded_question_count ?? report.completed_question_count ?? (report.question_scores || []).length ?? "-";
       const total = report.total_question_count ? ` / ${report.total_question_count}` : "";
       $("gradedCount").textContent = `${graded}${total}`;
@@ -1531,8 +1539,9 @@ INDEX_HTML = r"""<!doctype html>
       const completed = report.completed_question_count ?? report.score_summary?.graded_question_count ?? (report.question_scores || []).length ?? 0;
       const total = report.total_question_count ?? "";
       const text = audit.progress?.text || "等待任务开始";
+      const layoutText = audit.progress?.layout_scan_status || "整卷 xhigh 视觉定位：等待开始";
       const countText = total ? `已完成 ${completed}/${total} 题。` : "";
-      $("progressBox").textContent = `${countText}${text}`;
+      $("progressBox").textContent = `${layoutText}。${countText}${text}`;
     }
 
     function renderTable(rows) {
@@ -1549,7 +1558,7 @@ INDEX_HTML = r"""<!doctype html>
         <th>扣分点 / 原因</th>
       </tr></thead><tbody>`;
       for (const row of rows) {
-        const score = row.final_score === null || row.final_score === undefined ? "待复核" : `${row.final_score} / ${row.full_score}`;
+        const score = row.final_score === null || row.final_score === undefined ? "待复核" : `${formatScore(row.final_score)} / ${formatScore(row.full_score)}`;
         const source = row.student_answer_source || {};
         const recognized = source.recognized_student_answer || row.recognized_student_answer || row.grading_round_1?.recognized_student_answer || row.grading_round_1?.student_choice || "";
         const visualSummary = source.visual_reading_summary || row.visual_reading_summary || row.grading_round_1?.visual_reading_summary || "";
@@ -1581,6 +1590,13 @@ INDEX_HTML = r"""<!doctype html>
     function compactCell(value) {
       value = String(value || "").replace(/\s+/g, " ").trim();
       return value.length > 120 ? value.slice(0, 119) + "…" : value;
+    }
+
+    function formatScore(value) {
+      if (value === null || value === undefined || value === "") return "-";
+      const number = Number(value);
+      if (!Number.isFinite(number)) return String(value);
+      return Number.isInteger(number) ? String(number) : number.toFixed(1).replace(/\.0$/, "");
     }
 
     function escapeHtml(value) {
