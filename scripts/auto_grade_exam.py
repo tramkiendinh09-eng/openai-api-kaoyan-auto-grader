@@ -3943,12 +3943,9 @@ def reasoning_effort_for_item(config: ModelConfig, item: AnswerItem) -> str:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Prototype automatic grader for scanned postgraduate math papers.")
-    parser.add_argument("--submission", action="append", default=[], help="MinerU Markdown path for a student submission. Can be repeated.")
-    parser.add_argument("--submission-pdf", action="append", default=[], help="Original student submission PDF for visual review. Can be repeated.")
-    parser.add_argument("--question-paper", action="append", default=[], help="Question paper Markdown path. Can be repeated.")
-    parser.add_argument("--question-paper-pdf", action="append", default=[], help="Question paper PDF path. Converted/reused internally. Can be repeated.")
-    parser.add_argument("--reference", action="append", default=[], help="Reference/solution Markdown path. Can be repeated.")
-    parser.add_argument("--reference-pdf", action="append", default=[], help="Reference/solution PDF path. Converted/reused internally. Can be repeated.")
+    parser.add_argument("--submission-pdf", action="append", default=[], help="Student submission PDF. Can be repeated.")
+    parser.add_argument("--question-paper-pdf", action="append", default=[], help="Question paper PDF. Converted/reused internally. Can be repeated.")
+    parser.add_argument("--reference-pdf", action="append", default=[], help="Reference/solution PDF. Converted/reused internally. Can be repeated.")
     parser.add_argument("--reference-source-type", default="provided_reference", help="Source type label for references.")
     parser.add_argument("--reference-is-official", action="store_true", help="Mark references as official sources.")
     parser.add_argument("--paper-id", default="unknown-paper")
@@ -4002,36 +3999,42 @@ def main(argv: list[str]) -> int:
         raise ValueError("--run-id may contain only letters, numbers, underscore, dot, and hyphen")
     run_dir = Path(args.output_dir) / run_id
     audit_log = run_dir / "audit_log.jsonl"
+    if not args.submission_pdf:
+        raise ValueError("Provide at least one --submission-pdf PDF.")
+    if not args.question_paper_pdf:
+        raise ValueError("Provide at least one --question-paper-pdf PDF.")
+    if not args.reference_pdf:
+        raise ValueError("Provide at least one --reference-pdf PDF.")
+    for raw_path in args.submission_pdf + args.question_paper_pdf + args.reference_pdf:
+        if not Path(raw_path).resolve().exists():
+            raise FileNotFoundError(Path(raw_path).resolve())
     submission_paths, submission_pdf_paths = resolve_markdown_inputs(
-        args.submission,
+        [],
         args.submission_pdf,
         role="submission",
         run_dir=run_dir,
         audit_log=audit_log,
     )
     question_paper_paths, question_paper_pdf_paths = resolve_markdown_inputs(
-        args.question_paper,
+        [],
         args.question_paper_pdf,
         role="question_paper",
         run_dir=run_dir,
         audit_log=audit_log,
     )
     reference_paths, reference_pdf_paths = resolve_markdown_inputs(
-        args.reference,
+        [],
         args.reference_pdf,
         role="reference",
         run_dir=run_dir,
         audit_log=audit_log,
     )
     if not submission_paths:
-        raise ValueError("Provide at least one --submission Markdown or --submission-pdf PDF.")
+        raise ValueError("Unable to parse any student submission PDF.")
+    if not question_paper_paths:
+        raise ValueError("Unable to parse any question paper PDF.")
     if not reference_paths:
-        raise ValueError("Provide at least one --reference Markdown or --reference-pdf PDF.")
-    if not submission_pdf_paths:
-        for path in submission_paths:
-            guessed = guess_pdf_for_markdown(path)
-            if guessed is not None:
-                submission_pdf_paths.append(guessed)
+        raise ValueError("Unable to parse any reference/solution PDF.")
     for path in submission_paths + submission_pdf_paths + question_paper_paths + question_paper_pdf_paths + reference_paths + reference_pdf_paths:
         if not path.exists():
             raise FileNotFoundError(path)

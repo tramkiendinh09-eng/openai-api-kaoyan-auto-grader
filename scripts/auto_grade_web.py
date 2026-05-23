@@ -74,23 +74,6 @@ def read_request_json(handler: BaseHTTPRequestHandler) -> dict:
     return payload
 
 
-def list_md_files() -> list[dict[str, str]]:
-    roots = [MINERU_DIR, ROOT / "考情分析", ROOT / "output" / "markdown"]
-    rows: list[dict[str, str]] = []
-    for base in roots:
-        if not base.exists():
-            continue
-        for path in sorted(base.glob("*.md")):
-            rows.append(
-                {
-                    "name": path.name,
-                    "path": str(path),
-                    "group": str(base.relative_to(ROOT)) if base.is_relative_to(ROOT) else str(base),
-                }
-            )
-    return rows
-
-
 def list_pdf_files() -> list[dict[str, str]]:
     roots = [MINERU_DIR, *extra_search_dirs()]
     rows: list[dict[str, str]] = []
@@ -134,16 +117,10 @@ def sanitize_run_id(value: str) -> str:
 
 
 def start_grading_task(payload: dict) -> TaskState:
-    submission_raw = str(payload.get("submission") or "").strip()
-    submission = require_local_path(submission_raw) if submission_raw else None
     submission_pdf_raw = str(payload.get("submission_pdf") or "").strip()
     submission_pdf = require_local_path(submission_pdf_raw) if submission_pdf_raw else None
-    question_paper_raw = str(payload.get("question_paper") or "").strip()
-    question_paper = require_local_path(question_paper_raw) if question_paper_raw else None
     question_paper_pdf_raw = str(payload.get("question_paper_pdf") or "").strip()
     question_paper_pdf = require_local_path(question_paper_pdf_raw) if question_paper_pdf_raw else None
-    reference_raw = str(payload.get("reference") or "").strip()
-    reference = require_local_path(reference_raw) if reference_raw else None
     reference_pdf_raw = str(payload.get("reference_pdf") or "").strip()
     reference_pdf = require_local_path(reference_pdf_raw) if reference_pdf_raw else None
     api_url = str(payload.get("api_url") or "").strip()
@@ -174,18 +151,18 @@ def start_grading_task(payload: dict) -> TaskState:
     strict_official = bool(payload.get("strict_official"))
     policy_path = require_local_path(str(payload.get("policy_path") or str(DEFAULT_POLICY_PATH)))
 
-    if submission is None and submission_pdf is None:
-        raise ValueError("请至少选择一份学生答卷 PDF")
-    if reference is None and reference_pdf is None:
-        raise ValueError("请至少选择一份参考答案 PDF")
+    if submission_pdf is None:
+        raise ValueError("请选择学生答卷 PDF")
+    if question_paper_pdf is None:
+        raise ValueError("请选择试卷题目 PDF")
+    if reference_pdf is None:
+        raise ValueError("请选择参考答案 / 评分依据 PDF")
 
-    only_objective_questions = re.fullmatch(r"\s*(?:10|[1-9])(?:\s*(?:,|-)\s*(?:10|[1-9]))*\s*", questions or "")
-    objective_visual_required = bool(only_objective_questions and submission_pdf)
-    model_required = not parse_only and (not only_objective_questions or objective_visual_required)
+    model_required = not parse_only
     if model_required and not api_url:
-        raise ValueError("api_url is required unless parse_only is enabled or objective questions can be graded from a trusted answer line without PDF vision")
+        raise ValueError("调用模型时必须填写 API URL")
     if model_required and not api_key:
-        raise ValueError("api_key is required unless parse_only is enabled or objective questions can be graded from a trusted answer line without PDF vision")
+        raise ValueError("调用模型时必须填写 API Key")
 
     run_id = sanitize_run_id(f"web_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}")
     command = [
@@ -226,18 +203,9 @@ def start_grading_task(payload: dict) -> TaskState:
         "--policy-path",
         str(policy_path),
     ]
-    if submission is not None:
-        command.extend(["--submission", str(submission)])
-    if submission_pdf is not None:
-        command.extend(["--submission-pdf", str(submission_pdf)])
-    if question_paper is not None:
-        command.extend(["--question-paper", str(question_paper)])
-    if question_paper_pdf is not None:
-        command.extend(["--question-paper-pdf", str(question_paper_pdf)])
-    if reference is not None:
-        command.extend(["--reference", str(reference)])
-    if reference_pdf is not None:
-        command.extend(["--reference-pdf", str(reference_pdf)])
+    command.extend(["--submission-pdf", str(submission_pdf)])
+    command.extend(["--question-paper-pdf", str(question_paper_pdf)])
+    command.extend(["--reference-pdf", str(reference_pdf)])
     if questions:
         command.extend(["--questions", questions])
     if parse_only:
@@ -509,7 +477,6 @@ class Handler(BaseHTTPRequestHandler):
                 json_response(
                     self,
                     {
-                        "files": list_md_files(),
                         "pdf_files": list_pdf_files(),
                         "root": str(ROOT),
                         "default_policy_path": str(DEFAULT_POLICY_PATH),
@@ -764,7 +731,7 @@ INDEX_HTML = r"""<!doctype html>
       <select id="questionPaperPdf"></select>
       <label for="referencePdf">参考答案 / 评分依据 PDF</label>
       <select id="referencePdf"></select>
-      <div class="hint">只需要选择 PDF；系统会在后台优先复用 MinerU 解析结果，缺失时自动抽取 PDF 文本并把卷面图片交给 GPT 视觉复核。</div>
+      <div class="hint">只需要导入三份 PDF；MinerU/OCR 文本会在后台自动生成或复用，卷面页图会同步交给 GPT 视觉复核。</div>
       <div class="row">
         <div>
           <label for="questions">题号</label>
