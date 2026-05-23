@@ -42,6 +42,9 @@ DEFAULT_USER_AGENT = "Codex Desktop/0.133.0-alpha.1 (Windows 10.0.19045; x86_64)
 LOG_LOCK = threading.Lock()
 CACHE_LOCK = threading.Lock()
 RESULT_CACHE_LOCK = threading.Lock()
+UNLOCATED_BY_LAYOUT_REASON = "双xhigh整卷布局扫描未定位到本题题号或相邻题号；禁止使用固定页码裁剪，需人工复核完整答卷。"
+LAYOUT_SCAN_MAX_OUTPUT_TOKENS = 12000
+LAYOUT_SCAN_COMPACT_MAX_OUTPUT_TOKENS = 5000
 
 PROMPT_CACHE_PRIMER = """
 【考研数学阅卷固定协议】
@@ -802,14 +805,14 @@ def select_visual_pages_from_layout(
         return select_visual_pages(item, pages, max_pages=max_pages)
     entry = layout.items.get(item.question_no)
     if not isinstance(entry, dict):
-        return select_visual_pages(item, pages, max_pages=max_pages)
+        return []
     page_numbers = normalized_layout_page_numbers(entry)
     selected = [page for page in pages if page.page_no in page_numbers]
     if selected:
         if max_pages is not None:
             selected = selected[:max_pages]
         return selected
-    return select_visual_pages(item, pages, max_pages=max_pages)
+    return []
 
 
 def normalized_layout_page_numbers(entry: dict[str, Any]) -> list[int]:
@@ -913,6 +916,8 @@ def focus_box_specs_for_item(item: AnswerItem, layout: AnswerLayout | None = Non
     layout_specs = focus_box_specs_from_layout(item, layout)
     if layout_specs:
         return layout_specs
+    if layout is not None:
+        return []
     return focus_box_specs_for_question(int(item.question_no), item.question_type)
 
 
@@ -921,6 +926,8 @@ def focus_box_specs_from_layout(item: AnswerItem, layout: AnswerLayout | None) -
         return []
     entry = layout.items.get(item.question_no)
     if not isinstance(entry, dict):
+        return []
+    if not layout_entry_has_question_context(item, entry):
         return []
     raw_boxes = entry.get("answer_boxes")
     if not isinstance(raw_boxes, list):
@@ -935,6 +942,7 @@ def focus_box_specs_from_layout(item: AnswerItem, layout: AnswerLayout | None) -
             box = normalize_ratio_box([raw_box.get("x1"), raw_box.get("y1"), raw_box.get("x2"), raw_box.get("y2")])
         if box is None:
             continue
+        box = expand_focus_box_for_question_context(box, item.question_type)
         page_no = raw_box.get("page_no") or entry.get("page_no")
         try:
             page_no = int(page_no)
@@ -951,6 +959,67 @@ def focus_box_specs_from_layout(item: AnswerItem, layout: AnswerLayout | None) -
             }
         )
     return specs
+
+
+def layout_entry_has_question_context(item: AnswerItem, entry: dict[str, Any]) -> bool:
+    try:
+        question_no = int(item.question_no)
+    except (TypeError, ValueError):
+        return False
+    chunks = [
+        str(entry.get("recognized_answer_brief") or ""),
+        str(entry.get("notes") or ""),
+    ]
+    rounds = entry.get("layout_rounds")
+    if isinstance(rounds, dict):
+        for value in rounds.values():
+            if isinstance(value, dict):
+                chunks.append(str(value.get("recognized_answer_brief") or ""))
+                chunks.append(str(value.get("notes") or ""))
+    text = "；".join(chunk for chunk in chunks if chunk).strip()
+    if not text:
+        return False
+    if has_negative_question_marker(text, question_no):
+        return False
+    if has_question_marker(text, question_no):
+        return True
+    return any(
+        candidate > 0 and has_question_marker(text, candidate) and not has_negative_question_marker(text, candidate)
+        for candidate in (question_no - 1, question_no + 1)
+    )
+
+
+def has_question_marker(text: str, question_no: int) -> bool:
+    number = str(question_no)
+    patterns = [
+        rf"第\s*{number}\s*[题問问]",
+        rf"[题題問问]\s*号?\s*{number}(?!\d)",
+        rf"(?<!\d){number}\s*[题題問问]",
+        rf"(?<!\d){number}(?!\d)",
+    ]
+    return any(re.search(pattern, text) for pattern in patterns)
+
+
+def has_negative_question_marker(text: str, question_no: int) -> bool:
+    number = str(question_no)
+    marker = rf"(?:第\s*)?{number}\s*[题題問问]?"
+    before = rf"(?:未见|未发现|未定位|无|没有|不含|不覆盖|缺少|非|不是).{{0,12}}{marker}"
+    after = rf"{marker}.{{0,12}}(?:未见|未发现|未定位|无|没有|不含|不覆盖|缺少|非|不是)"
+    return bool(re.search(before, text) or re.search(after, text))
+
+
+def expand_focus_box_for_question_context(box: tuple[float, float, float, float], question_type: str) -> tuple[float, float, float, float]:
+    left, top, right, bottom = box
+    if question_type in {"objective", "blank"}:
+        pad_left, pad_right, pad_top, pad_bottom = 0.08, 0.04, 0.055, 0.04
+    else:
+        pad_left, pad_right, pad_top, pad_bottom = 0.06, 0.035, 0.045, 0.035
+    return (
+        max(0.0, left - pad_left),
+        max(0.0, top - pad_top),
+        min(1.0, right + pad_right),
+        min(1.0, bottom + pad_bottom),
+    )
 
 
 def normalize_ratio_box(value: Any) -> tuple[float, float, float, float] | None:
@@ -1032,11 +1101,17 @@ def visual_payload_for_item(
     focus_pages = visual_focus_pages_for_item(item, selected, layout=layout)
     layout_entry = layout.items.get(item.question_no) if layout else None
     used_layout = isinstance(layout_entry, dict) and bool(normalized_layout_page_numbers(layout_entry) or layout_entry.get("answer_boxes"))
+    layout_unlocated = layout is not None and not used_layout
+    if layout_unlocated and isinstance(layout_entry, dict):
+        page_values = normalized_layout_page_numbers(layout_entry)
+        layout_unlocated = not page_values and not ensure_list(layout_entry.get("answer_boxes"))
     return {
         "enabled": bool(selected),
         "selection_reason": (
             "layout_scan_guided_pdf_vision"
             if used_layout
+            else "layout_scan_unlocated_requires_human_review"
+            if layout_unlocated
             else "pdf_vision_required_for_grading"
             if selected
             else "not_required_or_unavailable"
@@ -1049,6 +1124,8 @@ def visual_payload_for_item(
         "attach_pdf_file": False,
         "focus_only": bool(focus_pages),
         "layout_scan": stable_layout_entry(item.question_no, layout_entry) if isinstance(layout_entry, dict) else None,
+        "layout_unlocated": layout_unlocated,
+        "layout_unlocated_reason": UNLOCATED_BY_LAYOUT_REASON if layout_unlocated else "",
     }
 
 
@@ -1151,19 +1228,36 @@ def objective_mapping_from_layout(layout: AnswerLayout | None) -> tuple[dict[str
     return mapping, used_runs
 
 
-def visual_payload_for_layout_scan(pages: list[VisualPage]) -> dict[str, Any]:
+def layout_scan_pages(pages: list[VisualPage], max_pages: int = 4) -> list[VisualPage]:
+    if len(pages) <= max_pages:
+        return pages
+    indexes = {0, len(pages) - 1}
+    if len(pages) > 2:
+        indexes.add(1)
+    if len(pages) > 3:
+        indexes.add(len(pages) - 2)
+    return [pages[index] for index in sorted(indexes)[:max_pages]]
+
+
+def visual_payload_for_layout_scan(pages: list[VisualPage], compact: bool = False) -> dict[str, Any]:
     if not pages:
         return {"enabled": False, "selection_reason": "not_required_or_unavailable", "pages": []}
-    payload_pages = [asdict(page) for page in pages]
+    selected_pages = layout_scan_pages(pages, max_pages=3 if compact else 4)
+    payload_pages = [asdict(page) for page in selected_pages]
     return {
         "enabled": True,
-        "selection_reason": "whole_submission_answer_layout_scan",
+        "selection_reason": "compact_whole_submission_answer_layout_scan" if compact else "whole_submission_answer_layout_scan",
         "pages": payload_pages,
         "focus_pages": [],
         "stable_pages": stable_visual_pages(payload_pages),
         "stable_focus_pages": [],
-        "pdf_sources": sorted({page.source_pdf for page in pages}),
+        "pdf_sources": sorted({page.source_pdf for page in selected_pages}),
         "attach_pdf_file": False,
+        "layout_scan_page_policy": {
+            "compact": compact,
+            "selected_page_count": len(selected_pages),
+            "total_page_count": len(pages),
+        },
     }
 
 
@@ -1470,6 +1564,39 @@ class ModelGateway:
             self.audit_log,
         )
 
+    def with_overrides(
+        self,
+        *,
+        reasoning_effort: str | None = None,
+        max_output_tokens: int | None = None,
+        timeout_seconds: int | None = None,
+        use_stream: bool | None = None,
+    ) -> "ModelGateway":
+        return ModelGateway(
+            ModelConfig(
+                api_url=self.config.api_url,
+                api_key=self.config.api_key,
+                model=self.config.model,
+                timeout_seconds=timeout_seconds if timeout_seconds is not None else self.config.timeout_seconds,
+                max_retries=self.config.max_retries,
+                temperature=self.config.temperature,
+                api_mode=self.config.api_mode,
+                use_cache=self.config.use_cache,
+                cache_dir=self.config.cache_dir,
+                max_output_tokens=max_output_tokens if max_output_tokens is not None else self.config.max_output_tokens,
+                reasoning_effort=reasoning_effort if reasoning_effort is not None else self.config.reasoning_effort,
+                objective_reasoning_effort=self.config.objective_reasoning_effort,
+                blank_reasoning_effort=self.config.blank_reasoning_effort,
+                solution_reasoning_effort=self.config.solution_reasoning_effort,
+                parallel_visual_rounds=self.config.parallel_visual_rounds,
+                objective_batch_mode=self.config.objective_batch_mode,
+                single_review=self.config.single_review,
+                use_stream=use_stream if use_stream is not None else self.config.use_stream,
+                user_agent=self.config.user_agent,
+            ),
+            self.audit_log,
+        )
+
     def cache_path(self, cache_key: str) -> Path:
         return Path(self.config.cache_dir) / f"{cache_key}.json"
 
@@ -1595,7 +1722,14 @@ class ModelGateway:
             body["stream"] = True
         return body
 
-    def call_json(self, messages: list[dict[str, str]], call_name: str) -> dict[str, Any]:
+    def call_json(
+        self,
+        messages: list[dict[str, str]],
+        call_name: str,
+        *,
+        max_network_retries: int | None = None,
+        max_degradation_attempts: int | None = None,
+    ) -> dict[str, Any]:
         attempts: list[dict[str, Any]] = [
             self.build_body(messages, json_mode=True, call_name=call_name, include_temperature=False, include_max_output=True, include_reasoning=True, include_images=True),
             self.build_body(messages, json_mode=True, call_name=call_name, include_temperature=True, include_max_output=True, include_reasoning=True, include_images=True),
@@ -1608,15 +1742,6 @@ class ModelGateway:
             self.build_body(messages, json_mode=False, call_name=call_name, include_temperature=False, include_max_output=False, include_reasoning=False, include_images=True),
             self.build_body(messages, json_mode=False, call_name=call_name, include_temperature=False, include_max_output=True, include_reasoning=False, include_images=False, include_files=False),
         ]
-        if self.config.use_stream:
-            expanded_attempts: list[dict[str, Any]] = []
-            for body in attempts:
-                expanded_attempts.append(body)
-                if body.get("stream"):
-                    non_stream_body = json.loads(json.dumps(body, ensure_ascii=False))
-                    non_stream_body.pop("stream", None)
-                    expanded_attempts.append(non_stream_body)
-            attempts = expanded_attempts
         for body in attempts:
             cached = self.read_cache(self.cache_key(body), call_name)
             if cached is not None:
@@ -1631,8 +1756,8 @@ class ModelGateway:
             "User-Agent": self.config.user_agent or DEFAULT_USER_AGENT,
         }
         last_error: str | None = None
-        degradation_limit = len(attempts)
-        network_retry_limit = max(1, self.config.max_retries)
+        degradation_limit = max(1, min(len(attempts), max_degradation_attempts or len(attempts)))
+        network_retry_limit = max(1, max_network_retries if max_network_retries is not None else self.config.max_retries)
         for degradation_no, body in enumerate(attempts[:degradation_limit], start=1):
             cache_key = self.cache_key(body)
             cached = self.read_cache(cache_key, call_name)
@@ -1780,9 +1905,13 @@ def parse_streaming_response_payload(text: str) -> dict[str, Any] | None:
     done_text_parts: list[str] = []
     last_completed: dict[str, Any] | None = None
     last_usage: dict[str, Any] | None = None
+    pending_event_type = ""
     for raw_line in text.splitlines():
         line = raw_line.strip()
         if not line or line.startswith(":"):
+            continue
+        if line.startswith("event:"):
+            pending_event_type = line[6:].strip()
             continue
         if line.startswith("data:"):
             line = line[5:].strip()
@@ -1791,10 +1920,14 @@ def parse_streaming_response_payload(text: str) -> dict[str, Any] | None:
         with contextlib.suppress(json.JSONDecodeError):
             event = json.loads(line)
             if isinstance(event, dict):
-                event_type = str(event.get("type") or "")
+                event_type = str(event.get("type") or pending_event_type or "")
+                if not event_type and isinstance(event.get("response"), dict):
+                    status = str(event["response"].get("status") or "")
+                    if status == "completed":
+                        event_type = "response.completed"
                 if event_type in {"response.output_text.delta", "response.refusal.delta"} and isinstance(event.get("delta"), str):
                     output_text_parts.append(event["delta"])
-                elif event_type in {"response.completed", "response.response.completed"} and isinstance(event.get("response"), dict):
+                elif event_type in {"response.completed", "response.response.completed", "response.done"} and isinstance(event.get("response"), dict):
                     last_completed = event["response"]
                     usage = last_completed.get("usage")
                     if isinstance(usage, dict):
@@ -1819,6 +1952,7 @@ def parse_streaming_response_payload(text: str) -> dict[str, Any] | None:
                         content = delta.get("content") or message.get("content")
                         if isinstance(content, str):
                             output_text_parts.append(content)
+                pending_event_type = ""
     if output_text_parts:
         payload: dict[str, Any] = {"output_text": "".join(output_text_parts)}
         if last_usage is not None:
@@ -2369,6 +2503,7 @@ def build_answer_layout_scan_messages(
     visual_payload: dict[str, Any],
     paper_id: str,
     scan_round: str = "A",
+    compact: bool = False,
 ) -> list[dict[str, Any]]:
     system = (
         PROMPT_CACHE_PRIMER
@@ -2378,17 +2513,19 @@ def build_answer_layout_scan_messages(
         "考生可能不按题号顺序作答，例如先写18再写17；你必须按卷面真实位置记录。"
         "输出必须是合法 JSON。"
     )
-    questions = [
-        {
+    questions = []
+    for item in items:
+        row = {
             "question_no": item.question_no,
             "question_type": item.question_type,
-            "mineru_answer_hint": compact_text(item.text, limit=280),
         }
-        for item in items
-    ]
+        if not compact:
+            row["mineru_answer_hint"] = compact_text(item.text, limit=160)
+        questions.append(row)
     user_payload = {
         "task": "scan_student_answer_layout_before_grading",
         "scan_round": scan_round,
+        "scan_mode": "compact" if compact else "full",
         "paper_id": paper_id,
         "questions": questions,
         "student_answer_visual_evidence": {
@@ -2399,12 +2536,11 @@ def build_answer_layout_scan_messages(
         "rules": [
             "只做定位和视觉转写辅助，不给分、不解题。",
             "必须特别处理 1-16 小题：先判断学生是集中写答案串，还是写在每道题题旁/横线附近。",
-            "选择题若出现类似“1~5: DBACB, 6~10: ACACB”的集中答案串，必须写入 objective_answer_runs，并给出覆盖题号、答案串、裁剪框。",
-            "选择题若写在各题旁边或选项旁边，不要强行合并成答案串；为每题给出 answer_boxes 和 recognized_answer_brief。",
-            "填空题必须按题号 11-16 分小块定位，框住题目横线附近的手写最终答案；不要只给整页或整段大框。",
-            "每题先找题号或学生写出的题号，再框出该题主要作答区域；跨页续写时给多个框。",
+            "选择题若出现类似“1~5: DBACB, 6~10: ACACB”的集中答案串，必须写入 objective_answer_runs。",
+            "填空题只在明确看到题号或相邻题号时定位；看不到题号上下文就不要给框。",
+            "每题先找题号或学生写出的题号，再框出该题主要作答区域；跨页续写时最多给两个框。",
             "answer_boxes 使用相对坐标 [x1,y1,x2,y2]，范围 0-1，覆盖学生作答，不要只框题号。",
-            "对小题，answer_boxes 应尽量紧贴最终答案区域，避免把相邻题作答框进去。",
+            "对小题，answer_boxes 必须带题号或相邻题号上下文，避免把相邻题作答框进去。",
             "若题号顺序与卷面顺序不同，is_out_of_order=true，并在 notes 说明。",
             "看不清或不能确定位置时仍返回该题，但 page_numbers=[]、confidence 低、needs_human_review=true。",
             "不要把题目 PDF 或参考答案当成学生作答；这里只看学生答卷。",
@@ -2437,9 +2573,10 @@ def build_answer_layout_scan_messages(
             "global_notes": "string",
         },
         "output_constraints": {
-            "max_boxes_per_question": 3,
-            "max_notes_chars": 120,
+            "max_boxes_per_question": 1 if compact else 2,
+            "max_notes_chars": 60 if compact else 90,
             "coordinate_precision": 3,
+            "compact_output": compact,
         },
     }
     user_parts: list[dict[str, Any]] = []
@@ -2461,7 +2598,7 @@ def scan_answer_layout(
     if not visual_pages or not items:
         return None
     visual_payload = visual_payload_for_layout_scan(visual_pages)
-    layout_gateway = gateway.for_reasoning_effort("xhigh")
+    layout_gateway = gateway.with_overrides(reasoning_effort="xhigh", max_output_tokens=LAYOUT_SCAN_MAX_OUTPUT_TOKENS, use_stream=True)
     append_jsonl(
         audit_log,
         {
@@ -2470,23 +2607,72 @@ def scan_answer_layout(
             "question_count": len(items),
             "page_count": len(visual_pages),
             "reasoning_effort": layout_gateway.config.reasoning_effort,
+            "max_output_tokens": layout_gateway.config.max_output_tokens,
+            "layout_payload_pages": len(visual_payload.get("pages") or []),
         },
     )
+    errors: list[str] = []
     try:
         with ThreadPoolExecutor(max_workers=2) as executor:
-            first_future = executor.submit(
-                layout_gateway.call_json,
-                build_answer_layout_scan_messages(items, visual_payload, paper_id, scan_round="A"),
-                "answer_layout_scan_A",
-            )
-            second_future = executor.submit(
-                layout_gateway.call_json,
-                build_answer_layout_scan_messages(items, visual_payload, paper_id, scan_round="B"),
-                "answer_layout_scan_B",
-            )
-            first_layout = normalize_answer_layout(first_future.result(), items, source="model_whole_submission_visual_scan_A")
-            second_layout = normalize_answer_layout(second_future.result(), items, source="model_whole_submission_visual_scan_B")
-        layout = merge_answer_layouts(first_layout, second_layout, items)
+            futures = {
+                executor.submit(
+                    layout_gateway.call_json,
+                    build_answer_layout_scan_messages(items, visual_payload, paper_id, scan_round="A"),
+                    "answer_layout_scan_A",
+                    max_network_retries=1,
+                    max_degradation_attempts=1,
+                ): "A",
+                executor.submit(
+                    layout_gateway.call_json,
+                    build_answer_layout_scan_messages(items, visual_payload, paper_id, scan_round="B"),
+                    "answer_layout_scan_B",
+                    max_network_retries=1,
+                    max_degradation_attempts=1,
+                ): "B",
+            }
+            layouts: dict[str, AnswerLayout] = {}
+            for future in as_completed(futures):
+                round_name = futures[future]
+                try:
+                    layouts[round_name] = normalize_answer_layout(
+                        future.result(),
+                        items,
+                        source=f"model_whole_submission_visual_scan_{round_name}",
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    error = f"{round_name}: {type(exc).__name__}: {exc}"
+                    errors.append(error)
+                    append_jsonl(
+                        audit_log,
+                        {
+                            "event": "answer_layout_scan_round_failed",
+                            "time": utc_now(),
+                            "round": round_name,
+                            "error": error,
+                        },
+                    )
+            if "A" in layouts and "B" in layouts:
+                layout = merge_answer_layouts(layouts["A"], layouts["B"], items)
+            elif layouts:
+                round_name, layout = next(iter(layouts.items()))
+                layout.source = f"single_xhigh_visual_scan_{round_name}_fallback"
+                layout.global_notes = truncate_str(
+                    "；".join(
+                        value
+                        for value in [
+                            layout.global_notes,
+                            "双xhigh视觉定位仅一路成功，后续单题视觉与 MinerU 需加强复核。",
+                            *errors,
+                        ]
+                        if value
+                    ),
+                    500,
+                )
+            else:
+                compact_layout = scan_answer_layout_compact_fallback(gateway, items, visual_pages, paper_id, audit_log, errors)
+                if compact_layout is not None:
+                    return compact_layout
+                raise RuntimeError("；".join(errors) or "dual xhigh visual scan failed")
         append_jsonl(
             audit_log,
             {
@@ -2501,6 +2687,7 @@ def scan_answer_layout(
                 ],
                 "global_notes": layout.global_notes,
                 "source": layout.source,
+                "round_errors": errors,
             },
         )
         return layout
@@ -2509,6 +2696,72 @@ def scan_answer_layout(
             audit_log,
             {
                 "event": "answer_layout_scan_failed",
+                "time": utc_now(),
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+        return None
+
+
+def scan_answer_layout_compact_fallback(
+    gateway: ModelGateway,
+    items: list[AnswerItem],
+    visual_pages: list[VisualPage],
+    paper_id: str,
+    audit_log: Path,
+    previous_errors: list[str],
+) -> AnswerLayout | None:
+    compact_payload = visual_payload_for_layout_scan(visual_pages, compact=True)
+    compact_gateway = gateway.with_overrides(reasoning_effort="high", max_output_tokens=LAYOUT_SCAN_COMPACT_MAX_OUTPUT_TOKENS, use_stream=True)
+    append_jsonl(
+        audit_log,
+        {
+            "event": "answer_layout_scan_compact_fallback_started",
+            "time": utc_now(),
+            "question_count": len(items),
+            "page_count": len(visual_pages),
+            "layout_payload_pages": len(compact_payload.get("pages") or []),
+            "reasoning_effort": compact_gateway.config.reasoning_effort,
+            "max_output_tokens": compact_gateway.config.max_output_tokens,
+            "previous_errors": previous_errors,
+        },
+    )
+    try:
+        raw = compact_gateway.call_json(
+            build_answer_layout_scan_messages(items, compact_payload, paper_id, scan_round="compact", compact=True),
+            "answer_layout_scan_compact",
+            max_network_retries=1,
+            max_degradation_attempts=1,
+        )
+        layout = normalize_answer_layout(raw, items, source="single_high_compact_visual_scan_fallback")
+        layout.global_notes = truncate_str(
+            "；".join(
+                value
+                for value in [
+                    layout.global_notes,
+                    "双xhigh布局扫描超时后启用紧凑high定位；未定位题不得使用固定模板裁剪。",
+                ]
+                if value
+            ),
+            500,
+        )
+        append_jsonl(
+            audit_log,
+            {
+                "event": "answer_layout_scan_compact_fallback_finished",
+                "time": utc_now(),
+                "located_question_count": sum(1 for entry in layout.items.values() if normalized_layout_page_numbers(entry)),
+                "objective_answer_run_count": len(layout.objective_answer_runs),
+                "global_notes": layout.global_notes,
+                "source": layout.source,
+            },
+        )
+        return layout
+    except Exception as exc:  # noqa: BLE001
+        append_jsonl(
+            audit_log,
+            {
+                "event": "answer_layout_scan_compact_fallback_failed",
                 "time": utc_now(),
                 "error": f"{type(exc).__name__}: {exc}",
             },
@@ -3078,6 +3331,41 @@ def local_objective_grade(
     result["grading_round_3"] = None
     result["scoring_engine"] = "local_objective"
     return result
+
+
+def layout_unlocated_review_result(item: AnswerItem, visual_payload: dict[str, Any]) -> dict[str, Any]:
+    layout_scan = visual_payload.get("layout_scan") if isinstance(visual_payload, dict) else None
+    notes = ""
+    if isinstance(layout_scan, dict):
+        notes = str(layout_scan.get("notes") or "")
+    reason = visual_payload.get("layout_unlocated_reason") or UNLOCATED_BY_LAYOUT_REASON
+    result = {
+        "question_no": item.question_no,
+        "question_type": item.question_type,
+        "full_score": item.full_score,
+        "third_arbitration_triggered": False,
+        "grading_round_1": None,
+        "grading_round_2": None,
+        "grading_round_3": None,
+        "final_score": None,
+        "recognized_student_answer": "",
+        "visual_reading_summary": "整卷布局扫描未发现本题题号、相邻题号或可靠作答框，已停止固定模板裁剪，避免错把其他题作答当成本题。",
+        "evidence_used": "insufficient",
+        "needs_human_review": True,
+        "review_reason": reason,
+        "confidence": 0.0,
+        "main_earned_points": [],
+        "main_deducted_points": ["本题未获得可靠卷面定位，不能进入自动评分。"],
+        "valid_student_steps": [],
+        "wrong_or_missing_steps": ["需人工核对完整PDF中本题作答位置。"],
+        "strict_scoring_checklist": [],
+        "layout_validation": {
+            "status": "unlocated_by_dual_xhigh_layout_scan",
+            "notes": notes,
+        },
+        "scoring_engine": "layout_unlocated_review_guard",
+    }
+    return normalize_result_final_score(result, item)
 
 
 def fallback_objective_batch_grade(
@@ -3966,6 +4254,32 @@ def grade_objective_batch_for_run(
             },
         )
         return results
+    if answer_layout is not None and not layout_mapping:
+        unlocated_items = [
+            item
+            for item in items
+            if item.needs_ocr_review
+            and not normalized_layout_page_numbers(answer_layout.items.get(item.question_no, {}))
+            and not ensure_list((answer_layout.items.get(item.question_no, {}) or {}).get("answer_boxes"))
+        ]
+        if len(unlocated_items) == len(items):
+            results = []
+            for item in items:
+                visual_payload = visual_payload_for_item(item, visual_pages, layout=answer_layout)
+                result = layout_unlocated_review_result(item, visual_payload)
+                reference = reference_bank.get(item.question_no)
+                attach_common_result_metadata(result, item, reference, question_reference=None, visual_sources=visual_payload)
+                results.append(result)
+            append_jsonl(
+                gateway.audit_log,
+                {
+                    "event": "objective_batch_layout_unlocated_short_circuit",
+                    "time": utc_now(),
+                    "question_nos": [item.question_no for item in items],
+                    "reason": UNLOCATED_BY_LAYOUT_REASON,
+                },
+            )
+            return results
     visual_payload = visual_payload_for_objective_batch(items, visual_pages)
     local_results = fallback_objective_batch_grade(
         items,
@@ -4343,6 +4657,26 @@ def grade_one_item_for_run(
     rubric = rubric_for(item, reference, strict_official=bool(strict_official))
     local_result = local_objective_grade(item, reference, strict_official=bool(strict_official))
     item_visual_payload = visual_payload_for_item(item, visual_pages, layout=answer_layout)
+    if item_visual_payload.get("layout_unlocated") and (item.needs_ocr_review or item.ocr_confidence < 0.68):
+        result = layout_unlocated_review_result(item, item_visual_payload)
+        attach_common_result_metadata(
+            result,
+            item,
+            reference,
+            question_reference=question_reference,
+            visual_sources=item_visual_payload,
+        )
+        append_jsonl(
+            item_gateway.audit_log,
+            {
+                "event": "layout_unlocated_review_required",
+                "time": utc_now(),
+                "question_no": item.question_no,
+                "reason": result.get("review_reason"),
+                "layout_scan": item_visual_payload.get("layout_scan"),
+            },
+        )
+        return result
     result_cache_key = None
     if item_gateway.config.use_cache:
         result_cache_key = question_result_cache_key(

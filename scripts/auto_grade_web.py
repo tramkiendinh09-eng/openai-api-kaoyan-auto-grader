@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import io
 import json
 import os
 import re
@@ -15,7 +16,7 @@ from dataclasses import dataclass, field
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -67,6 +68,20 @@ def text_response(handler: BaseHTTPRequestHandler, text: str, status: int = 200,
     handler.send_response(status)
     handler.send_header("Content-Type", f"{content_type}; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def binary_response(handler: BaseHTTPRequestHandler, body: bytes, filename: str, content_type: str) -> None:
+    safe_ascii_name = re.sub(r"[^A-Za-z0-9_.-]", "_", filename) or "download.bin"
+    handler.send_response(HTTPStatus.OK)
+    handler.send_header("Content-Type", content_type)
+    handler.send_header("Content-Length", str(len(body)))
+    handler.send_header("Cache-Control", "no-store")
+    handler.send_header(
+        "Content-Disposition",
+        f"attachment; filename=\"{safe_ascii_name}\"; filename*=UTF-8''{quote(filename)}",
+    )
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -274,7 +289,7 @@ def build_grading_command(payload: dict, submission_pdf: Path, run_id: str, cand
     parallel_visual_rounds = bool(payload.get("parallel_visual_rounds", True))
     objective_batch_mode = bool(payload.get("objective_batch_mode", True))
     single_review = bool(payload.get("single_review", True))
-    use_stream = bool(payload.get("use_stream", True))
+    use_stream = True
     max_retries = int(payload.get("max_retries") or 3)
     timeout_seconds = int(payload.get("timeout_seconds") or 180)
     max_output_tokens = int(payload.get("max_output_tokens") or 100000)
@@ -363,10 +378,7 @@ def build_grading_command(payload: dict, submission_pdf: Path, run_id: str, cand
         command.append("--single-review")
     else:
         command.append("--double-review")
-    if use_stream:
-        command.append("--stream")
-    else:
-        command.append("--no-stream")
+    command.append("--stream")
     if layout_scan:
         command.append("--layout-scan")
     else:
@@ -573,6 +585,337 @@ def load_report(run_id: str, filename: str) -> object:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def load_score_report(run_id: str) -> dict:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id):
+        raise ValueError("bad run id")
+    run_dir = OUTPUT_DIR / run_id
+    for filename in ("grading_report.json", "partial_report.json"):
+        path = run_dir / filename
+        if path.exists():
+            report = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(report, dict):
+                report["_scorebook_source_file"] = filename
+                return report
+    raise FileNotFoundError(f"未找到 {run_id} 的 grading_report.json 或 partial_report.json")
+
+
+def scorebook_run_ids(run_id: str) -> list[str]:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id):
+        raise ValueError("bad run id")
+    with TASK_LOCK:
+        task = TASKS.get(run_id)
+        child_run_ids = list(task.child_run_ids) if task and task.child_run_ids else []
+    if child_run_ids:
+        return child_run_ids
+    direct_dir = OUTPUT_DIR / run_id
+    if (direct_dir / "grading_report.json").exists() or (direct_dir / "partial_report.json").exists():
+        return [run_id]
+    if not OUTPUT_DIR.exists():
+        return [run_id]
+    prefix = run_id + "_"
+    inferred = sorted(
+        [
+            path.name
+            for path in OUTPUT_DIR.iterdir()
+            if path.is_dir()
+            and path.name.startswith(prefix)
+            and ((path / "grading_report.json").exists() or (path / "partial_report.json").exists())
+        ]
+    )
+    return inferred or [run_id]
+
+
+def text_for_excel(value: object, max_chars: int = 2800) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        text = "\n".join(str(item) for item in value if item is not None)
+    elif isinstance(value, dict):
+        text = json.dumps(value, ensure_ascii=False, default=str)
+    else:
+        text = str(value)
+    text = re.sub(r"[\x00-\x08\x0B-\x0C\x0E-\x1F]", "", text)
+    text = re.sub(r"[ \t]+\n", "\n", text).strip()
+    if len(text) > max_chars:
+        return text[: max_chars - 1] + "…"
+    return text
+
+
+def export_list(value: object) -> list[object]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def numeric_score(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(number, 2)
+
+
+def score_text(value: object) -> str | float:
+    number = numeric_score(value)
+    return "需复核" if number is None else number
+
+
+def round_score(row: dict, key: str) -> str | float:
+    round_payload = row.get(key)
+    if isinstance(round_payload, dict):
+        return score_text(round_payload.get("score"))
+    return ""
+
+
+def sheet_title(raw: str, used: set[str]) -> str:
+    title = re.sub(r"[\[\]:*?/\\]", "_", raw).strip() or "得分表"
+    title = title[:31]
+    candidate = title
+    suffix = 2
+    while candidate in used:
+        marker = f"_{suffix}"
+        candidate = f"{title[: 31 - len(marker)]}{marker}"
+        suffix += 1
+    used.add(candidate)
+    return candidate
+
+
+def candidate_label(report: dict, fallback: str) -> str:
+    candidate = report.get("candidate") if isinstance(report.get("candidate"), dict) else {}
+    name = str(candidate.get("name") or "").strip()
+    return name or fallback
+
+
+def build_scorebook(run_id: str) -> tuple[bytes, str]:
+    try:
+        from openpyxl import Workbook
+        from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+        from openpyxl.utils import get_column_letter
+    except ImportError as exc:  # pragma: no cover - local dependency guard
+        raise RuntimeError("缺少 openpyxl，无法生成 XLSX 得分表。请先安装 openpyxl。") from exc
+
+    child_ids = scorebook_run_ids(run_id)
+    reports: list[tuple[str, dict]] = []
+    errors: list[tuple[str, str]] = []
+    for child_id in child_ids:
+        try:
+            reports.append((child_id, load_score_report(child_id)))
+        except Exception as exc:  # noqa: BLE001
+            errors.append((child_id, f"{type(exc).__name__}: {exc}"))
+    if not reports and errors:
+        raise FileNotFoundError(errors[0][1])
+    if not reports:
+        raise FileNotFoundError(f"未找到 {run_id} 的可导出报告")
+
+    wb = Workbook()
+    used_titles: set[str] = set()
+    header_fill = PatternFill("solid", fgColor="EAF2F8")
+    title_fill = PatternFill("solid", fgColor="17324D")
+    review_fill = PatternFill("solid", fgColor="FFF1F0")
+    ok_fill = PatternFill("solid", fgColor="EFFAF4")
+    thin = Side(style="thin", color="D9DEE5")
+    border = Border(bottom=thin)
+    wrap = Alignment(vertical="top", wrap_text=True)
+
+    def style_columns(ws) -> None:
+        widths = {
+            "A": 8,
+            "B": 10,
+            "C": 10,
+            "D": 8,
+            "E": 10,
+            "F": 10,
+            "G": 10,
+            "H": 10,
+            "I": 10,
+            "J": 14,
+            "K": 28,
+            "L": 28,
+            "M": 28,
+            "N": 28,
+            "O": 22,
+            "P": 26,
+        }
+        for col, width in widths.items():
+            ws.column_dimensions[col].width = width
+
+    def apply_table_style(ws, header_row: int, max_col: int) -> None:
+        for cell in ws[header_row]:
+            if cell.column <= max_col:
+                cell.fill = header_fill
+                cell.font = Font(bold=True, color="1F2937")
+                cell.border = border
+                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        for row in ws.iter_rows(min_row=header_row + 1, max_row=ws.max_row, max_col=max_col):
+            for cell in row:
+                cell.border = border
+                cell.alignment = wrap
+        ws.freeze_panes = ws.cell(row=header_row + 1, column=1)
+        ws.auto_filter.ref = f"A{header_row}:{get_column_letter(max_col)}{ws.max_row}"
+
+    def write_score_sheet(ws, child_run_id: str, report: dict) -> None:
+        summary = report.get("score_summary") if isinstance(report.get("score_summary"), dict) else {}
+        paper = report.get("paper") if isinstance(report.get("paper"), dict) else {}
+        module_scores = report.get("module_scores") if isinstance(report.get("module_scores"), list) else []
+        rows = report.get("question_scores") if isinstance(report.get("question_scores"), list) else []
+        total_score = score_text(summary.get("total_score_for_graded_questions"))
+        full_score = score_text(paper.get("total_full_score_for_graded_questions"))
+        ws["A1"] = "考研数学自动阅卷得分表"
+        ws["A1"].font = Font(bold=True, color="FFFFFF", size=14)
+        ws["A1"].fill = title_fill
+        ws.merge_cells("A1:P1")
+        ws["A2"] = "Run ID"
+        ws["B2"] = child_run_id
+        ws["A3"] = "考生"
+        ws["B3"] = candidate_label(report, child_run_id)
+        ws["A4"] = "试卷"
+        ws["B4"] = paper.get("paper_id") or ""
+        ws["D2"] = "总分"
+        ws["E2"] = f"{total_score} / {full_score}"
+        ws["D3"] = "已评题数"
+        ws["E3"] = summary.get("graded_question_count", len(rows))
+        ws["D4"] = "需复核"
+        ws["E4"] = summary.get("human_review_count", sum(1 for row in rows if isinstance(row, dict) and row.get("needs_human_review")))
+        ws["G2"] = "报告类型"
+        ws["H2"] = report.get("_scorebook_source_file") or ""
+        ws["G3"] = "生成时间"
+        ws["H3"] = report.get("generated_at") or ""
+        ws["G4"] = "模块得分"
+        ws["H4"] = "；".join(
+            f"{item.get('module')} {score_text(item.get('score'))}/{score_text(item.get('full_score'))}"
+            for item in module_scores
+            if isinstance(item, dict)
+        )
+        for key_cell in ("A2", "A3", "A4", "D2", "D3", "D4", "G2", "G3", "G4"):
+            ws[key_cell].font = Font(bold=True, color="374151")
+        for row_no in range(2, 5):
+            for col_no in range(1, 17):
+                ws.cell(row=row_no, column=col_no).alignment = wrap
+
+        headers = [
+            "题号",
+            "题型",
+            "最终得分",
+            "满分",
+            "第一次评分",
+            "第二次评分",
+            "第三次评分",
+            "需人工复核",
+            "置信度",
+            "评分引擎",
+            "识别作答",
+            "主要得分点",
+            "主要扣分点/原因",
+            "有效步骤",
+            "错误或缺失步骤",
+            "视觉与证据",
+        ]
+        header_row = 7
+        for col_no, header in enumerate(headers, start=1):
+            ws.cell(row=header_row, column=col_no, value=header)
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            source = row.get("student_answer_source") if isinstance(row.get("student_answer_source"), dict) else {}
+            visual_sources = row.get("visual_sources") if isinstance(row.get("visual_sources"), dict) else {}
+            final_score = score_text(row.get("final_score"))
+            excel_row = [
+                text_for_excel(row.get("question_no"), 80),
+                text_for_excel(row.get("question_type"), 80),
+                final_score,
+                score_text(row.get("full_score")),
+                round_score(row, "grading_round_1"),
+                round_score(row, "grading_round_2"),
+                round_score(row, "grading_round_3"),
+                "是" if row.get("needs_human_review") else "否",
+                numeric_score(row.get("confidence")),
+                text_for_excel(row.get("scoring_engine") or row.get("evidence_used"), 180),
+                text_for_excel(
+                    row.get("recognized_student_answer")
+                    or source.get("recognized_student_answer")
+                    or source.get("student_answer_ocr"),
+                    1400,
+                ),
+                text_for_excel(row.get("main_earned_points") or row.get("earned_points"), 1800),
+                text_for_excel(export_list(row.get("main_deducted_points") or row.get("deducted_points")) + ([row.get("review_reason")] if row.get("review_reason") else []), 1800),
+                text_for_excel(row.get("valid_student_steps"), 1800),
+                text_for_excel(row.get("wrong_or_missing_steps"), 1800),
+                text_for_excel(
+                    {
+                        "evidence_used": row.get("evidence_used") or source.get("evidence_used"),
+                        "visual_reading_summary": row.get("visual_reading_summary") or source.get("visual_reading_summary"),
+                        "selection_reason": visual_sources.get("selection_reason"),
+                    },
+                    1800,
+                ),
+            ]
+            ws.append(excel_row)
+            current_row = ws.max_row
+            if row.get("needs_human_review"):
+                ws.cell(current_row, 8).fill = review_fill
+            elif row.get("final_score") is not None:
+                ws.cell(current_row, 8).fill = ok_fill
+        style_columns(ws)
+        apply_table_style(ws, header_row, len(headers))
+
+    def write_summary_sheet(ws) -> None:
+        ws.title = sheet_title("汇总", used_titles)
+        ws["A1"] = "批量阅卷得分表汇总"
+        ws["A1"].font = Font(bold=True, color="FFFFFF", size=14)
+        ws["A1"].fill = title_fill
+        ws.merge_cells("A1:H1")
+        headers = ["序号", "Sheet", "Run ID", "考生", "总分", "满分", "已评题数", "需复核"]
+        for col_no, header in enumerate(headers, start=1):
+            ws.cell(row=3, column=col_no, value=header)
+        for idx, (child_id, report) in enumerate(reports, start=1):
+            summary = report.get("score_summary") if isinstance(report.get("score_summary"), dict) else {}
+            paper = report.get("paper") if isinstance(report.get("paper"), dict) else {}
+            title = sheet_title(f"{idx:03d}_{candidate_label(report, child_id)}", used_titles)
+            ws.append(
+                [
+                    idx,
+                    title,
+                    child_id,
+                    candidate_label(report, child_id),
+                    score_text(summary.get("total_score_for_graded_questions")),
+                    score_text(paper.get("total_full_score_for_graded_questions")),
+                    summary.get("graded_question_count", len(report.get("question_scores") or [])),
+                    summary.get("human_review_count", ""),
+                ]
+            )
+        for col_no, width in enumerate([8, 24, 42, 30, 10, 10, 12, 10], start=1):
+            ws.column_dimensions[get_column_letter(col_no)].width = width
+        apply_table_style(ws, 3, len(headers))
+
+    if len(reports) > 1:
+        write_summary_sheet(wb.active)
+        for idx, (child_id, report) in enumerate(reports, start=1):
+            title = wb.active.cell(row=idx + 3, column=2).value or f"{idx:03d}"
+            ws = wb.create_sheet(str(title))
+            write_score_sheet(ws, child_id, report)
+    else:
+        child_id, report = reports[0]
+        ws = wb.active
+        ws.title = sheet_title("得分表", used_titles)
+        write_score_sheet(ws, child_id, report)
+
+    if errors:
+        ws = wb.create_sheet(sheet_title("导出错误", used_titles))
+        ws.append(["Run ID", "错误"])
+        for child_id, error in errors:
+            ws.append([child_id, error])
+        apply_table_style(ws, 1, 2)
+
+    output = io.BytesIO()
+    wb.save(output)
+    filename = f"得分表_{run_id}.xlsx"
+    return output.getvalue(), filename
+
+
 def load_audit_tail(run_id: str) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id):
         raise ValueError("bad run id")
@@ -590,14 +933,23 @@ def load_audit_tail(run_id: str) -> dict:
 
 
 def audit_progress(events: list[dict]) -> dict:
+    def as_int(value: object, default: int = 0) -> int:
+        try:
+            return int(value)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return default
+
     latest_question = None
     latest_round = None
     latest_event = None
     latest_elapsed = None
     latest_error = None
     layout_scan_status = "双xhigh视觉小格定位：尚未看到日志"
-    completed_calls = 0
+    successful_calls = 0
+    failed_calls = 0
     active_calls = 0
+    model_tasks: set[str] = set()
+    retry_or_degrade_calls = 0
     for event in events:
         if not isinstance(event, dict):
             continue
@@ -606,6 +958,16 @@ def audit_progress(events: list[dict]) -> dict:
             layout_scan_status = "双xhigh视觉小格定位：已发起"
         elif name == "answer_layout_scan_finished":
             layout_scan_status = f"双xhigh视觉小格定位：已完成，定位 {event.get('located_question_count', 0)} 题，答案串 {event.get('objective_answer_run_count', 0)} 组"
+            if event.get("round_errors"):
+                layout_scan_status += "，其中一路失败已兜底"
+        elif name == "answer_layout_scan_round_failed":
+            layout_scan_status = f"双xhigh视觉小格定位：{event.get('round', '')} 路失败，等待另一路或兜底"
+        elif name == "answer_layout_scan_compact_fallback_started":
+            layout_scan_status = "双xhigh视觉小格定位：双路超时，已启动紧凑high兜底"
+        elif name == "answer_layout_scan_compact_fallback_finished":
+            layout_scan_status = f"紧凑high视觉定位：已完成，定位 {event.get('located_question_count', 0)} 题，答案串 {event.get('objective_answer_run_count', 0)} 组"
+        elif name == "answer_layout_scan_compact_fallback_failed":
+            layout_scan_status = "紧凑high视觉定位：失败，已改用页码启发式"
         elif name == "answer_layout_scan_failed":
             layout_scan_status = "双xhigh视觉小格定位：失败，已改用页码启发式"
         if name in {"visual_evidence_attached", "local_objective_grade"} and event.get("question_no"):
@@ -632,6 +994,24 @@ def audit_progress(events: list[dict]) -> dict:
             latest_question = "整卷"
             latest_round = f"双xhigh视觉小格定位完成，定位 {event.get('located_question_count', 0)} 题"
             latest_event = name
+        elif name == "answer_layout_scan_round_failed":
+            latest_question = "整卷"
+            latest_round = f"双xhigh视觉小格定位 {event.get('round', '')} 路失败"
+            latest_event = name
+            latest_error = str(event.get("error") or "")
+        elif name == "answer_layout_scan_compact_fallback_started":
+            latest_question = "整卷"
+            latest_round = "紧凑high视觉定位兜底已发起"
+            latest_event = name
+        elif name == "answer_layout_scan_compact_fallback_finished":
+            latest_question = "整卷"
+            latest_round = f"紧凑high视觉定位完成，定位 {event.get('located_question_count', 0)} 题"
+            latest_event = name
+        elif name == "answer_layout_scan_compact_fallback_failed":
+            latest_question = "整卷"
+            latest_round = "紧凑high视觉定位失败，改用旧的页码启发式"
+            latest_event = name
+            latest_error = str(event.get("error") or "")
         elif name == "answer_layout_scan_failed":
             latest_question = "整卷"
             latest_round = "双xhigh视觉小格定位失败，改用旧的页码启发式"
@@ -645,10 +1025,19 @@ def audit_progress(events: list[dict]) -> dict:
             latest_event = name
         elif name in {"model_call_started", "model_call", "model_call_error"}:
             call_name = str(event.get("call_name") or "")
+            if call_name:
+                model_tasks.add(call_name)
+            attempt_no = as_int(event.get("attempt_no"), 1)
+            retry_no = as_int(event.get("retry_no"), 1)
+            if attempt_no > 1 or retry_no > 1:
+                retry_or_degrade_calls += 1
             if name == "model_call_started":
                 active_calls += 1
             else:
-                completed_calls += 1
+                if name == "model_call" and as_int(event.get("status_code")) < 400:
+                    successful_calls += 1
+                else:
+                    failed_calls += 1
                 active_calls = max(0, active_calls - 1)
             match = re.search(r"q(\d+)_(?:round(\d+)|single)", call_name)
             if match:
@@ -666,7 +1055,7 @@ def audit_progress(events: list[dict]) -> dict:
                     latest_round = f"选择题视觉读选项第 {round_no} 轮"
                 if name == "model_call_started":
                     latest_round += "已发起"
-            elif call_name == "answer_layout_scan":
+            elif call_name.startswith("answer_layout_scan"):
                 latest_question = "整卷"
                 latest_round = "双xhigh视觉小格定位"
                 if name == "model_call_started":
@@ -687,8 +1076,14 @@ def audit_progress(events: list[dict]) -> dict:
             text += f"，上次调用 {latest_elapsed}s"
     if latest_error:
         text += f"，最近错误：{latest_error[:120]}"
-    if completed_calls:
-        text += f"，模型调用完成 {completed_calls} 次"
+    if model_tasks:
+        text += f"，模型任务 {len(model_tasks)} 个"
+    if successful_calls:
+        text += f"，成功 {successful_calls} 次"
+    if failed_calls:
+        text += f"，失败/重试 {failed_calls} 次"
+    if retry_or_degrade_calls:
+        text += f"，额外重试/降级 {retry_or_degrade_calls} 次"
     if active_calls:
         text += f"，活跃调用约 {active_calls} 次"
     return {
@@ -698,7 +1093,11 @@ def audit_progress(events: list[dict]) -> dict:
         "layout_scan_status": layout_scan_status,
         "latest_elapsed_seconds": latest_elapsed,
         "latest_error": latest_error,
-        "completed_model_calls": completed_calls,
+        "completed_model_calls": successful_calls,
+        "successful_model_calls": successful_calls,
+        "failed_model_calls": failed_calls,
+        "model_task_count": len(model_tasks),
+        "retry_or_degrade_model_calls": retry_or_degrade_calls,
         "active_model_calls": active_calls,
         "text": text,
     }
@@ -707,11 +1106,42 @@ def audit_progress(events: list[dict]) -> dict:
 def latest_runs() -> list[dict[str, str]]:
     if not OUTPUT_DIR.exists():
         return []
-    rows = []
-    for path in sorted(OUTPUT_DIR.iterdir(), key=lambda item: item.stat().st_mtime, reverse=True)[:20]:
+    rows: list[dict[str, object]] = []
+    child_runs_by_parent: dict[str, list[Path]] = {}
+    ignored = {"web_server", "cache", "question_result_cache", "scorebooks"}
+    for path in OUTPUT_DIR.iterdir():
         if not path.is_dir():
             continue
-        if path.name == "web_server":
+        if path.name in ignored:
+            continue
+        match = re.match(r"^(web_\d{8}_\d{6}_[A-Za-z0-9]{6})_\d{3}_", path.name)
+        if match:
+            child_runs_by_parent.setdefault(match.group(1), []).append(path)
+
+    for parent_id, child_paths in child_runs_by_parent.items():
+        child_paths = sorted(child_paths, key=lambda item: item.name)
+        report_count = sum(1 for child in child_paths if (child / "grading_report.json").exists())
+        mtime = max(child.stat().st_mtime for child in child_paths)
+        rows.append(
+            {
+                "run_id": parent_id,
+                "path": str(OUTPUT_DIR),
+                "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(mtime)),
+                "has_report": report_count > 0,
+                "is_batch": True,
+                "child_count": len(child_paths),
+                "report_count": report_count,
+                "child_run_ids": [child.name for child in child_paths],
+                "view_run_id": child_paths[0].name if child_paths else parent_id,
+            }
+        )
+
+    for path in OUTPUT_DIR.iterdir():
+        if not path.is_dir():
+            continue
+        if path.name in ignored:
+            continue
+        if any(path in child_paths for child_paths in child_runs_by_parent.values()):
             continue
         report = path / "grading_report.json"
         rows.append(
@@ -720,9 +1150,14 @@ def latest_runs() -> list[dict[str, str]]:
                 "path": str(path),
                 "mtime": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(path.stat().st_mtime)),
                 "has_report": report.exists(),
+                "is_batch": False,
+                "child_count": 1,
+                "report_count": 1 if report.exists() else 0,
+                "child_run_ids": [],
+                "view_run_id": path.name,
             }
         )
-    return rows
+    return sorted(rows, key=lambda row: str(row.get("mtime", "")), reverse=True)[:20]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -760,6 +1195,16 @@ class Handler(BaseHTTPRequestHandler):
                 run_id = query.get("run_id", [""])[0]
                 filename = query.get("file", ["grading_report.json"])[0]
                 json_response(self, load_report(run_id, filename))
+            elif parsed.path == "/api/scorebook":
+                query = parse_qs(parsed.query)
+                run_id = query.get("run_id", [""])[0]
+                body, filename = build_scorebook(run_id)
+                binary_response(
+                    self,
+                    body,
+                    filename,
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                )
             elif parsed.path == "/api/audit":
                 query = parse_qs(parsed.query)
                 run_id = query.get("run_id", [""])[0]
@@ -832,16 +1277,20 @@ INDEX_HTML = r"""<!doctype html>
   <style>
     :root {
       color-scheme: light;
-      --ink: #202124;
-      --muted: #626a73;
-      --line: #d9dee5;
+      --ink: #111827;
+      --muted: #667085;
+      --line: #d0d7de;
       --panel: #ffffff;
-      --bg: #f5f7fa;
-      --accent: #0f766e;
-      --accent-dark: #0b5f59;
+      --panel-soft: #f8fafc;
+      --bg: #f3f5f8;
+      --accent: #2563eb;
+      --accent-dark: #1d4ed8;
+      --teal: #0f766e;
       --danger: #b42318;
-      --warn: #946200;
-      --ok: #16794c;
+      --warn: #b45309;
+      --ok: #15803d;
+      --purple: #6d28d9;
+      --shadow: 0 12px 28px rgba(15, 23, 42, .08);
     }
     * { box-sizing: border-box; }
     body {
@@ -855,25 +1304,41 @@ INDEX_HTML = r"""<!doctype html>
     header {
       background: #ffffff;
       border-bottom: 1px solid var(--line);
-      padding: 16px 24px;
+      padding: 14px 24px;
       display: flex;
       justify-content: space-between;
       align-items: center;
       gap: 16px;
+      position: sticky;
+      top: 0;
+      z-index: 20;
     }
-    h1 { margin: 0; font-size: 20px; letter-spacing: 0; }
-    h2 { margin: 0 0 12px; font-size: 16px; }
+    h1 { margin: 0; font-size: 19px; letter-spacing: 0; }
+    h2 { margin: 0 0 12px; font-size: 15px; }
+    .brand { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+    .brand .hint { margin-top: 0; }
     main {
-      padding: 20px 24px 32px;
+      padding: 18px 24px 32px;
       display: grid;
-      grid-template-columns: minmax(360px, 480px) minmax(520px, 1fr);
+      grid-template-columns: minmax(380px, 470px) minmax(560px, 1fr);
       gap: 18px;
+      align-items: start;
     }
     section {
       background: var(--panel);
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 16px;
+      box-shadow: var(--shadow);
+    }
+    .control-panel {
+      position: sticky;
+      top: 76px;
+      max-height: calc(100vh - 92px);
+      overflow: auto;
+    }
+    .result-panel {
+      min-width: 0;
     }
     label { display: block; font-weight: 600; margin: 12px 0 6px; }
     input, select, textarea, button {
@@ -887,6 +1352,10 @@ INDEX_HTML = r"""<!doctype html>
       background: #fff;
       min-height: 38px;
     }
+    input:focus, select:focus {
+      outline: 2px solid rgba(37, 99, 235, .18);
+      border-color: var(--accent);
+    }
     .file-row {
       display: grid;
       grid-template-columns: minmax(0, 1fr) auto;
@@ -898,7 +1367,7 @@ INDEX_HTML = r"""<!doctype html>
       border-radius: 8px;
       padding: 10px;
       margin-top: 8px;
-      background: #fbfcfd;
+      background: var(--panel-soft);
     }
     .file-manager select {
       min-height: 90px;
@@ -945,8 +1414,8 @@ INDEX_HTML = r"""<!doctype html>
       min-height: 38px;
     }
     button:hover { background: var(--accent-dark); }
-    button.secondary { background: #e7eef4; color: var(--ink); }
-    button.secondary:hover { background: #d9e4ed; }
+    button.secondary { background: #edf2f7; color: var(--ink); border: 1px solid #d7dee8; }
+    button.secondary:hover { background: #e2e8f0; }
     button:disabled { opacity: .55; cursor: not-allowed; }
     .actions { display: flex; gap: 10px; margin-top: 16px; }
     button.danger { background: var(--danger); }
@@ -973,6 +1442,24 @@ INDEX_HTML = r"""<!doctype html>
       justify-content: space-between;
       margin-bottom: 12px;
     }
+    .result-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 12px;
+    }
+    .result-actions {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+    .run-path {
+      margin-top: 4px;
+      max-width: 760px;
+      overflow-wrap: anywhere;
+    }
     .report-grid {
       display: grid;
       grid-template-columns: repeat(4, minmax(90px, 1fr));
@@ -983,15 +1470,29 @@ INDEX_HTML = r"""<!doctype html>
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 10px;
-      background: #fbfcfd;
+      background: var(--panel-soft);
     }
-    .metric strong { display: block; font-size: 18px; }
+    .metric strong { display: block; font-size: 20px; line-height: 1.2; }
     .metric span { color: var(--muted); font-size: 12px; }
+    .metric:nth-child(1) { border-top: 3px solid var(--accent); }
+    .metric:nth-child(2) { border-top: 3px solid var(--teal); }
+    .metric:nth-child(3) { border-top: 3px solid var(--warn); }
+    .metric:nth-child(4) { border-top: 3px solid var(--purple); }
+    .progress-box {
+      border: 1px solid #d6e0ea;
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      padding: 10px 12px;
+      background: #f8fbff;
+      color: #334155;
+      margin-bottom: 10px;
+    }
     table {
       width: 100%;
       border-collapse: collapse;
       table-layout: fixed;
       margin-top: 8px;
+      background: #fff;
     }
     th, td {
       border-bottom: 1px solid var(--line);
@@ -1001,6 +1502,13 @@ INDEX_HTML = r"""<!doctype html>
       word-break: break-word;
     }
     th { background: #f8fafc; font-weight: 700; }
+    thead th {
+      position: sticky;
+      top: 63px;
+      z-index: 5;
+      box-shadow: inset 0 -1px 0 var(--line);
+    }
+    tbody tr:hover { background: #fbfdff; }
     pre {
       margin: 0;
       padding: 12px;
@@ -1012,9 +1520,9 @@ INDEX_HTML = r"""<!doctype html>
       white-space: pre-wrap;
       word-break: break-word;
     }
-    .tabs { display: flex; gap: 8px; margin: 14px 0 10px; }
+    .tabs { display: flex; gap: 8px; margin: 14px 0 10px; border-bottom: 1px solid var(--line); }
     .tabs button { background: #e7eef4; color: var(--ink); }
-    .tabs button.active { background: var(--accent); color: white; }
+    .tabs button.active { background: var(--accent); color: white; border-color: var(--accent); }
     .run-list {
       margin-top: 14px;
       border-top: 1px solid var(--line);
@@ -1028,24 +1536,28 @@ INDEX_HTML = r"""<!doctype html>
       padding: 6px 0;
       border-bottom: 1px solid #edf0f4;
     }
+    .run-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
     .run-item button { padding: 6px 9px; min-height: 30px; }
     @media (max-width: 980px) {
       main { grid-template-columns: 1fr; padding: 14px; }
       .report-grid { grid-template-columns: repeat(2, 1fr); }
       header { align-items: flex-start; flex-direction: column; }
+      .control-panel { position: static; max-height: none; }
+      .result-head { flex-direction: column; }
+      thead th { top: 0; }
     }
   </style>
 </head>
 <body>
   <header>
-    <div>
+    <div class="brand">
       <h1>考研数学自动阅卷本地原型</h1>
       <div class="hint" id="rootHint">正在读取本地文件...</div>
     </div>
     <div class="status" id="statusBadge">未运行</div>
   </header>
   <main>
-    <section>
+    <section class="control-panel">
       <h2>阅卷配置</h2>
       <label for="submissionPdf">学生答卷 PDF</label>
       <div class="file-row">
@@ -1189,7 +1701,7 @@ INDEX_HTML = r"""<!doctype html>
       <div class="checks">
         <label><input id="parseOnly" type="checkbox" /> 只解析不调用模型</label>
         <label><input id="useCache" type="checkbox" checked /> 调试缓存</label>
-        <label><input id="useStream" type="checkbox" /> 流式接收</label>
+        <label><input id="useStream" type="checkbox" checked disabled /> 流式接收</label>
         <label><input id="layoutScan" type="checkbox" checked /> 先整卷视觉定位</label>
         <label><input id="objectiveBatchMode" type="checkbox" checked /> 选择题10题批量</label>
         <label><input id="singleReview" type="checkbox" checked /> 单评极速</label>
@@ -1208,10 +1720,16 @@ INDEX_HTML = r"""<!doctype html>
         <div id="runs"></div>
       </div>
     </section>
-    <section>
-      <div class="toolbar">
-        <h2>运行结果</h2>
-        <div id="runId" class="hint"></div>
+    <section class="result-panel">
+      <div class="result-head">
+        <div>
+          <h2>运行结果</h2>
+          <div id="runId" class="hint run-path"></div>
+        </div>
+        <div class="result-actions">
+          <button id="downloadScorebookBtn" class="secondary" disabled>下载得分表</button>
+          <button id="refreshReportBtn" class="secondary" disabled>刷新报告</button>
+        </div>
       </div>
       <div class="report-grid">
         <div class="metric"><strong id="totalScore">-</strong><span>总分</span></div>
@@ -1219,13 +1737,14 @@ INDEX_HTML = r"""<!doctype html>
         <div class="metric"><strong id="reviewCount">-</strong><span>需复核</span></div>
         <div class="metric"><strong id="arbCount">-</strong><span>仲裁次数</span></div>
       </div>
-      <div id="progressBox" class="hint">双xhigh视觉小格定位：等待开始。等待任务开始</div>
+      <div id="progressBox" class="progress-box">双xhigh视觉小格定位：等待开始。等待任务开始</div>
       <div id="summary"></div>
       <div class="tabs">
         <button class="active" data-tab="table">得分表</button>
         <button data-tab="json">报告 JSON</button>
         <button data-tab="audit">日志摘要</button>
       </div>
+      <div class="hint">得分表也可导出为 Excel：单张卷为一个 sheet，批量任务为同一工作簿多个 sheet。</div>
       <div id="tablePanel"></div>
       <pre id="jsonPanel" style="display:none"></pre>
       <pre id="auditPanel" style="display:none"></pre>
@@ -1233,6 +1752,8 @@ INDEX_HTML = r"""<!doctype html>
   </main>
   <script>
     let currentRunId = null;
+    let scorebookRunId = null;
+    let displayedRunId = null;
     let pollTimer = null;
     let activeTab = "table";
 
@@ -1270,6 +1791,13 @@ INDEX_HTML = r"""<!doctype html>
 
     function selectedValues(select) {
       return Array.from(select.selectedOptions || []).map(option => option.value).filter(Boolean);
+    }
+
+    function setScorebookRun(runId, enabled = true) {
+      scorebookRunId = runId || null;
+      const btn = $("downloadScorebookBtn");
+      btn.disabled = !enabled || !scorebookRunId;
+      btn.textContent = scorebookRunId ? "下载得分表" : "等待得分表";
     }
 
     async function loadFiles() {
@@ -1414,12 +1942,22 @@ INDEX_HTML = r"""<!doctype html>
       for (const run of [...taskRuns, ...data.runs].slice(0, 8)) {
         const row = document.createElement("div");
         row.className = "run-item";
-        row.innerHTML = `<div><strong>${escapeHtml(run.run_id)}</strong><div class="hint">${escapeHtml(run.mtime)} ${run.has_report ? "有报告" : "无完整报告"}</div></div>`;
+        const batchMark = run.is_batch ? `批量 ${run.report_count || 0}/${run.child_count || 0}` : (run.has_report ? "有报告" : "无完整报告");
+        row.innerHTML = `<div><strong>${escapeHtml(run.run_id)}</strong><div class="hint">${escapeHtml(run.mtime)} ${escapeHtml(batchMark)}</div></div>`;
+        const actions = document.createElement("div");
+        actions.className = "run-actions";
         const btn = document.createElement("button");
         btn.className = "secondary";
         btn.textContent = "查看";
-        btn.onclick = () => showRun(run.run_id);
-        row.appendChild(btn);
+        btn.onclick = () => showRun(run.view_run_id || run.run_id, run.run_id);
+        actions.appendChild(btn);
+        const exportBtn = document.createElement("button");
+        exportBtn.className = "secondary";
+        exportBtn.textContent = "导出";
+        exportBtn.disabled = !run.has_report;
+        exportBtn.onclick = () => downloadScorebook(run.run_id);
+        actions.appendChild(exportBtn);
+        row.appendChild(actions);
         box.appendChild(row);
       }
     }
@@ -1450,7 +1988,7 @@ INDEX_HTML = r"""<!doctype html>
         solution_concurrency: Number($("solutionConcurrency").value || 3),
         parse_only: $("parseOnly").checked,
         use_cache: $("useCache").checked,
-        use_stream: $("useStream").checked,
+        use_stream: true,
         layout_scan: $("layoutScan").checked,
         objective_batch_mode: $("objectiveBatchMode").checked,
         single_review: $("singleReview").checked,
@@ -1467,8 +2005,10 @@ INDEX_HTML = r"""<!doctype html>
         body: JSON.stringify(payload)
       });
       currentRunId = data.task.run_id;
+      setScorebookRun(currentRunId, false);
       $("runId").textContent = currentRunId;
       $("stopBtn").disabled = false;
+      $("refreshReportBtn").disabled = false;
       pollTask();
       if (pollTimer) clearInterval(pollTimer);
       pollTimer = setInterval(pollTask, 2500);
@@ -1481,8 +2021,10 @@ INDEX_HTML = r"""<!doctype html>
         const task = data.task;
         setStatus(statusText(task.status), task.status);
         const visibleRunId = task.current_child_run_id || task.child_run_ids?.[Math.max(0, (task.batch_index || 1) - 1)] || task.run_id;
+        const exportRunId = (task.status === "finished" && (task.child_run_ids || []).length) ? task.run_id : visibleRunId;
         const batchText = task.batch_total > 1 ? `批量 ${task.batch_index}/${task.batch_total} | ` : "";
         $("runId").textContent = `${batchText}${visibleRunId} | ${task.output_dir}`;
+        setScorebookRun(exportRunId, task.status === "finished" || task.status === "failed" || Boolean(visibleRunId));
         await loadReportOrPartial(visibleRunId);
         if (task.status === "finished" || task.status === "failed") {
           $("startBtn").disabled = false;
@@ -1494,10 +2036,12 @@ INDEX_HTML = r"""<!doctype html>
       } catch (err) {
         setStatus("轮询失败", "failed");
         $("auditPanel").textContent = String(err);
+        document.querySelector('[data-tab="audit"]').click();
       }
     }
 
     async function loadReportOrPartial(runId) {
+      displayedRunId = runId;
       let report = await api(`/api/report?run_id=${encodeURIComponent(runId)}&file=grading_report.json`);
       if (!report.available && !report.score_summary) {
         report = await api(`/api/report?run_id=${encodeURIComponent(runId)}&file=partial_report.json`);
@@ -1506,13 +2050,17 @@ INDEX_HTML = r"""<!doctype html>
       const audit = await api(`/api/audit?run_id=${encodeURIComponent(runId)}`);
       $("auditPanel").textContent = JSON.stringify(audit, null, 2);
       renderProgress(report, audit);
+      setScorebookRun(scorebookRunId || runId, Boolean((report.question_scores || []).length || report.score_summary));
+      return report;
     }
 
-    async function showRun(runId) {
-      currentRunId = runId;
-      $("runId").textContent = runId;
+    async function showRun(runId, exportRunId = null) {
+      currentRunId = exportRunId || runId;
+      setScorebookRun(exportRunId || runId, true);
+      $("runId").textContent = exportRunId && exportRunId !== runId ? `${exportRunId} | 查看 ${runId}` : runId;
       setStatus("查看结果", "finished");
       $("stopBtn").disabled = true;
+      $("refreshReportBtn").disabled = false;
       await loadReportOrPartial(runId);
     }
 
@@ -1528,6 +2076,51 @@ INDEX_HTML = r"""<!doctype html>
       setStatus(statusText(data.task.status), data.task.status);
       await loadReportOrPartial(currentRunId);
       $("startBtn").disabled = false;
+    }
+
+    async function downloadScorebook(runId) {
+      const targetRunId = runId || scorebookRunId || currentRunId;
+      if (!targetRunId) return;
+      const btn = $("downloadScorebookBtn");
+      const oldText = btn.textContent;
+      btn.disabled = true;
+      btn.textContent = "正在生成...";
+      try {
+        const res = await fetch(`/api/scorebook?run_id=${encodeURIComponent(targetRunId)}`);
+        if (!res.ok) {
+          let message = res.statusText;
+          try {
+            const data = await res.json();
+            message = data.error || message;
+          } catch (_) {}
+          throw new Error(message);
+        }
+        const blob = await res.blob();
+        const disposition = res.headers.get("Content-Disposition") || "";
+        const filename = scorebookFilename(disposition, targetRunId);
+        const url = URL.createObjectURL(blob);
+        const link = document.createElement("a");
+        link.href = url;
+        link.download = filename;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        URL.revokeObjectURL(url);
+      } catch (err) {
+        alert("得分表导出失败：" + err);
+      } finally {
+        btn.disabled = !scorebookRunId && !currentRunId;
+        btn.textContent = oldText;
+      }
+    }
+
+    function scorebookFilename(disposition, runId) {
+      const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+      if (utf8Match) {
+        try { return decodeURIComponent(utf8Match[1]); } catch (_) {}
+      }
+      const asciiMatch = disposition.match(/filename="?([^";]+)"?/i);
+      return asciiMatch ? asciiMatch[1] : `得分表_${runId}.xlsx`;
     }
 
     function renderReport(report) {
@@ -1650,6 +2243,11 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelector('[data-tab="audit"]').click();
     });
     $("refreshBtn").onclick = () => loadFiles().catch(err => alert(err));
+    $("downloadScorebookBtn").onclick = () => downloadScorebook(scorebookRunId || currentRunId);
+    $("refreshReportBtn").onclick = () => {
+      const runId = displayedRunId || currentRunId;
+      if (runId) loadReportOrPartial(runId).catch(err => alert(err));
+    };
     ["submissionPdf", "questionPaperPdf", "referencePdf"].forEach(id => {
       $(id).onchange = () => refreshFileCount($(id));
     });
