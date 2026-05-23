@@ -21,6 +21,7 @@ from urllib.parse import parse_qs, urlparse
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_PATH = ROOT / "scripts" / "auto_grade_exam.py"
 MINERU_DIR = ROOT / "tmp" / "mineru_grading"
+UPLOAD_DIR = ROOT / "tmp" / "uploads"
 OUTPUT_DIR = ROOT / "output" / "auto_grading"
 DEFAULT_POLICY_PATH = ROOT / "config" / "kaoyan_math_grading_policy.md"
 
@@ -75,7 +76,7 @@ def read_request_json(handler: BaseHTTPRequestHandler) -> dict:
 
 
 def list_pdf_files() -> list[dict[str, str]]:
-    roots = [MINERU_DIR, *extra_search_dirs()]
+    roots = [UPLOAD_DIR, MINERU_DIR, *extra_search_dirs()]
     rows: list[dict[str, str]] = []
     for base in roots:
         if not base.exists():
@@ -85,7 +86,7 @@ def list_pdf_files() -> list[dict[str, str]]:
                 {
                     "name": path.name,
                     "path": str(path),
-                    "group": str(base.relative_to(ROOT)) if base.is_relative_to(ROOT) else str(base),
+                    "group": str(path.parent.relative_to(ROOT)) if path.parent.is_relative_to(ROOT) else str(path.parent),
                 }
             )
     return rows
@@ -96,6 +97,55 @@ def extra_search_dirs() -> list[Path]:
     if not raw.strip():
         return []
     return [Path(part).expanduser() for part in re.split(r"[;\n]", raw) if part.strip()]
+
+
+def safe_upload_filename(raw_name: str) -> str:
+    name = Path(raw_name or "uploaded.pdf").name
+    stem = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff_. -]+", "_", Path(name).stem).strip(" ._")
+    suffix = Path(name).suffix.lower()
+    if suffix != ".pdf":
+        suffix = ".pdf"
+    return f"{stem or 'uploaded'}{suffix}"
+
+
+def save_uploaded_pdf(handler: BaseHTTPRequestHandler, role: str) -> dict[str, str]:
+    if role not in {"submission", "question_paper", "reference"}:
+        raise ValueError("bad upload role")
+    content_type = handler.headers.get("Content-Type", "")
+    match = re.search(r"boundary=(?P<boundary>[^;]+)", content_type)
+    if "multipart/form-data" not in content_type or not match:
+        raise ValueError("upload must be multipart/form-data")
+    boundary = match.group("boundary").strip().strip('"').encode("utf-8")
+    length = int(handler.headers.get("Content-Length", "0") or "0")
+    if length <= 0:
+        raise ValueError("empty upload")
+    if length > 80 * 1024 * 1024:
+        raise ValueError("PDF 超过 80MB，请先压缩或拆分")
+    raw = handler.rfile.read(length)
+    marker = b"--" + boundary
+    for part in raw.split(marker):
+        if b"filename=" not in part:
+            continue
+        header, sep, body = part.partition(b"\r\n\r\n")
+        if not sep:
+            continue
+        filename_match = re.search(rb'filename="([^"]*)"', header)
+        filename = filename_match.group(1).decode("utf-8", errors="replace") if filename_match else "uploaded.pdf"
+        body = body.rsplit(b"\r\n", 1)[0]
+        if not body.startswith(b"%PDF"):
+            raise ValueError("上传文件不像 PDF，请确认文件格式")
+        role_dir = UPLOAD_DIR / role
+        role_dir.mkdir(parents=True, exist_ok=True)
+        target_name = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}_{safe_upload_filename(filename)}"
+        target = role_dir / target_name
+        target.write_bytes(body)
+        return {
+            "name": target.name,
+            "path": str(target),
+            "group": str(role_dir.relative_to(ROOT)),
+            "role": role,
+        }
+    raise ValueError("未找到上传的 PDF 文件")
 
 
 def require_local_path(raw: str) -> Path:
@@ -517,6 +567,12 @@ class Handler(BaseHTTPRequestHandler):
                 state = stop_grading_task(run_id)
                 json_response(self, {"ok": True, "task": task_to_dict(state)})
                 return
+            if parsed.path == "/api/upload":
+                query = parse_qs(parsed.query)
+                role = query.get("role", [""])[0]
+                uploaded = save_uploaded_pdf(self, role)
+                json_response(self, {"ok": True, "file": uploaded, "pdf_files": list_pdf_files()})
+                return
             if parsed.path != "/api/grade":
                 text_response(self, "Not found", status=404)
                 return
@@ -605,6 +661,16 @@ INDEX_HTML = r"""<!doctype html>
       border-radius: 6px;
       padding: 9px 10px;
       background: #fff;
+      min-height: 38px;
+    }
+    .file-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 8px;
+      align-items: center;
+    }
+    input[type="file"] {
+      padding: 8px;
       min-height: 38px;
     }
     .row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
@@ -726,12 +792,24 @@ INDEX_HTML = r"""<!doctype html>
     <section>
       <h2>阅卷配置</h2>
       <label for="submissionPdf">学生答卷 PDF</label>
+      <div class="file-row">
+        <input id="submissionUpload" type="file" accept="application/pdf,.pdf" />
+        <button class="secondary" data-upload-role="submission">导入</button>
+      </div>
       <select id="submissionPdf"></select>
       <label for="questionPaperPdf">试卷题目 PDF</label>
+      <div class="file-row">
+        <input id="questionPaperUpload" type="file" accept="application/pdf,.pdf" />
+        <button class="secondary" data-upload-role="question_paper">导入</button>
+      </div>
       <select id="questionPaperPdf"></select>
       <label for="referencePdf">参考答案 / 评分依据 PDF</label>
+      <div class="file-row">
+        <input id="referenceUpload" type="file" accept="application/pdf,.pdf" />
+        <button class="secondary" data-upload-role="reference">导入</button>
+      </div>
       <select id="referencePdf"></select>
-      <div class="hint">只需要导入三份 PDF；MinerU/OCR 文本会在后台自动生成或复用，卷面页图会同步交给 GPT 视觉复核。</div>
+      <div class="hint" id="uploadHint">先点“导入”把本地 PDF 放入项目临时目录；MinerU/OCR 文本会在后台自动生成或复用，卷面页图会同步交给 GPT 视觉复核。</div>
       <div class="row">
         <div>
           <label for="questions">题号</label>
@@ -886,6 +964,16 @@ INDEX_HTML = r"""<!doctype html>
       return data;
     }
 
+    function selectValue(select, value) {
+      if (!value) return;
+      for (const option of select.options) {
+        if (option.value === value) {
+          select.value = value;
+          return;
+        }
+      }
+    }
+
     async function loadFiles() {
       const data = await api("/api/files");
       $("rootHint").textContent = "项目目录：" + data.root;
@@ -907,6 +995,30 @@ INDEX_HTML = r"""<!doctype html>
         if (file.name === preferredName) option.selected = true;
       }
       if (old) select.value = old;
+    }
+
+    async function uploadPdf(role) {
+      const map = {
+        submission: {input: "submissionUpload", select: "submissionPdf", label: "学生答卷"},
+        question_paper: {input: "questionPaperUpload", select: "questionPaperPdf", label: "试卷题目"},
+        reference: {input: "referenceUpload", select: "referencePdf", label: "参考答案"}
+      };
+      const cfg = map[role];
+      const fileInput = $(cfg.input);
+      const file = fileInput.files && fileInput.files[0];
+      if (!file) throw new Error(`请先选择${cfg.label} PDF`);
+      if (!file.name.toLowerCase().endsWith(".pdf")) throw new Error("只能导入 PDF 文件");
+      $("uploadHint").textContent = `正在导入 ${file.name} ...`;
+      const form = new FormData();
+      form.append("file", file, file.name);
+      const data = await api("/api/upload?role=" + encodeURIComponent(role), {
+        method: "POST",
+        body: form
+      });
+      await loadFiles();
+      selectValue($(cfg.select), data.file.path);
+      $("uploadHint").textContent = `已导入 ${data.file.name}，可以继续选择其他 PDF 或开始阅卷。`;
+      fileInput.value = "";
     }
 
     async function loadRuns() {
@@ -1140,6 +1252,12 @@ INDEX_HTML = r"""<!doctype html>
       document.querySelector('[data-tab="audit"]').click();
     });
     $("refreshBtn").onclick = () => loadFiles().catch(err => alert(err));
+    document.querySelectorAll("[data-upload-role]").forEach(btn => {
+      btn.onclick = () => uploadPdf(btn.dataset.uploadRole).catch(err => {
+        $("uploadHint").textContent = String(err);
+        alert(err);
+      });
+    });
     loadFiles().catch(err => {
       setStatus("初始化失败", "failed");
       $("auditPanel").textContent = String(err);
