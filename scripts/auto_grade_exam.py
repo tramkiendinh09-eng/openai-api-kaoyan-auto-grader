@@ -1040,6 +1040,8 @@ def visual_payload_for_item(
         "stable_pages": stable_visual_pages(payload_pages),
         "stable_focus_pages": stable_visual_pages(focus_pages),
         "pdf_sources": sorted({page.source_pdf for page in selected}),
+        "attach_pdf_file": False,
+        "focus_only": bool(focus_pages),
         "layout_scan": stable_layout_entry(item.question_no, layout_entry) if isinstance(layout_entry, dict) else None,
     }
 
@@ -2043,6 +2045,8 @@ def append_visual_attention_parts(
 ) -> None:
     pages = (visual_payload or {}).get("pages", [])
     focus_pages = (visual_payload or {}).get("focus_pages", [])
+    if focus_pages and (visual_payload or {}).get("focus_only", True):
+        pages = []
     if not pages and not focus_pages:
         return
     user_parts.append(
@@ -2193,9 +2197,10 @@ def build_grade_messages(
         },
     }
     if visual_payload and "stable_pages" in visual_payload:
+        stable_pages_for_payload = [] if visual_payload.get("focus_pages") and visual_payload.get("focus_only", True) else visual_payload.get("stable_pages", [])
         user_payload["student_answer_visual_evidence"] = {
             **{key: value for key, value in visual_payload.items() if key not in {"pages", "focus_pages"}},
-            "pages": visual_payload.get("stable_pages", []),
+            "pages": stable_pages_for_payload,
             "focus_pages": visual_payload.get("stable_focus_pages", []),
         }
     user_parts: list[dict[str, Any]] = []
@@ -2260,9 +2265,10 @@ def build_objective_batch_messages(
         },
     }
     if visual_payload and "stable_pages" in visual_payload:
+        stable_pages_for_payload = [] if visual_payload.get("focus_pages") and visual_payload.get("focus_only", True) else visual_payload.get("stable_pages", [])
         user_payload["student_answer_visual_evidence"] = {
             **{key: value for key, value in visual_payload.items() if key not in {"pages", "focus_pages"}},
-            "pages": visual_payload.get("stable_pages", []),
+            "pages": stable_pages_for_payload,
             "focus_pages": visual_payload.get("stable_focus_pages", []),
         }
     user_parts: list[dict[str, Any]] = []

@@ -1168,22 +1168,22 @@ INDEX_HTML = r"""<!doctype html>
       <label for="maxOutputTokens">单次最大输出 tokens</label>
       <input id="maxOutputTokens" type="number" value="100000" min="200" max="200000" />
       <label for="concurrency">题目并发数</label>
-      <input id="concurrency" type="number" value="10" min="1" max="10" />
+      <input id="concurrency" type="number" value="5" min="1" max="10" />
       <div class="row">
         <div>
           <label for="blankConcurrency">填空并发</label>
-          <input id="blankConcurrency" type="number" value="3" min="1" max="6" />
+          <input id="blankConcurrency" type="number" value="2" min="1" max="6" />
         </div>
         <div>
           <label for="solutionConcurrency">大题并发</label>
-          <input id="solutionConcurrency" type="number" value="6" min="1" max="6" />
+          <input id="solutionConcurrency" type="number" value="3" min="1" max="6" />
         </div>
       </div>
-      <div class="hint">当前为 10 路单评：选择题批任务 1 路，填空最多 3 路，大题最多 6 路。</div>
+      <div class="hint">当前为稳态并发：选择题批任务 1 路，填空最多 2 路，大题最多 3 路；中转站不稳时比 10 路更容易跑完整张卷。</div>
       <div class="checks">
         <label><input id="parseOnly" type="checkbox" /> 只解析不调用模型</label>
         <label><input id="useCache" type="checkbox" checked /> 调试缓存</label>
-        <label><input id="useStream" type="checkbox" checked /> 流式接收</label>
+        <label><input id="useStream" type="checkbox" /> 流式接收</label>
         <label><input id="layoutScan" type="checkbox" checked /> 先整卷视觉定位</label>
         <label><input id="objectiveBatchMode" type="checkbox" checked /> 选择题10题批量</label>
         <label><input id="singleReview" type="checkbox" checked /> 单评极速</label>
@@ -1439,8 +1439,8 @@ INDEX_HTML = r"""<!doctype html>
         max_retries: Number($("retries").value || 3),
         max_output_tokens: Number($("maxOutputTokens").value || 100000),
         concurrency: Number($("concurrency").value || 10),
-        blank_concurrency: Number($("blankConcurrency").value || 3),
-        solution_concurrency: Number($("solutionConcurrency").value || 6),
+        blank_concurrency: Number($("blankConcurrency").value || 2),
+        solution_concurrency: Number($("solutionConcurrency").value || 3),
         parse_only: $("parseOnly").checked,
         use_cache: $("useCache").checked,
         use_stream: $("useStream").checked,
