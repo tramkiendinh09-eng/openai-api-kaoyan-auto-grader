@@ -43,6 +43,11 @@ class TaskState:
     stderr: str = ""
     output_dir: str = ""
     error: str | None = None
+    batch_index: int = 1
+    batch_total: int = 1
+    child_run_ids: list[str] = field(default_factory=list)
+    current_child_run_id: str | None = None
+    batch_results: list[dict[str, str]] = field(default_factory=list)
     process: subprocess.Popen | None = field(default=None, repr=False, compare=False)
 
 
@@ -108,7 +113,7 @@ def safe_upload_filename(raw_name: str) -> str:
     return f"{stem or 'uploaded'}{suffix}"
 
 
-def save_uploaded_pdf(handler: BaseHTTPRequestHandler, role: str) -> dict[str, str]:
+def save_uploaded_pdfs(handler: BaseHTTPRequestHandler, role: str) -> list[dict[str, str]]:
     if role not in {"submission", "question_paper", "reference"}:
         raise ValueError("bad upload role")
     content_type = handler.headers.get("Content-Type", "")
@@ -123,6 +128,7 @@ def save_uploaded_pdf(handler: BaseHTTPRequestHandler, role: str) -> dict[str, s
         raise ValueError("PDF 超过 80MB，请先压缩或拆分")
     raw = handler.rfile.read(length)
     marker = b"--" + boundary
+    uploaded: list[dict[str, str]] = []
     for part in raw.split(marker):
         if b"filename=" not in part:
             continue
@@ -131,7 +137,7 @@ def save_uploaded_pdf(handler: BaseHTTPRequestHandler, role: str) -> dict[str, s
             continue
         filename_match = re.search(rb'filename="([^"]*)"', header)
         filename = filename_match.group(1).decode("utf-8", errors="replace") if filename_match else "uploaded.pdf"
-        body = body.rsplit(b"\r\n", 1)[0]
+        body = body.rstrip(b"\r\n-")
         if not body.startswith(b"%PDF"):
             raise ValueError("上传文件不像 PDF，请确认文件格式")
         role_dir = UPLOAD_DIR / role
@@ -139,13 +145,17 @@ def save_uploaded_pdf(handler: BaseHTTPRequestHandler, role: str) -> dict[str, s
         target_name = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}_{safe_upload_filename(filename)}"
         target = role_dir / target_name
         target.write_bytes(body)
-        return {
-            "name": target.name,
-            "path": str(target),
-            "group": str(role_dir.relative_to(ROOT)),
-            "role": role,
-        }
-    raise ValueError("未找到上传的 PDF 文件")
+        uploaded.append(
+            {
+                "name": target.name,
+                "path": str(target),
+                "group": str(role_dir.relative_to(ROOT)),
+                "role": role,
+            }
+        )
+    if not uploaded:
+        raise ValueError("未找到上传的 PDF 文件")
+    return uploaded
 
 
 def require_local_path(raw: str) -> Path:
@@ -166,9 +176,26 @@ def sanitize_run_id(value: str) -> str:
     return value[:80] or f"web_{uuid.uuid4().hex[:8]}"
 
 
-def start_grading_task(payload: dict) -> TaskState:
-    submission_pdf_raw = str(payload.get("submission_pdf") or "").strip()
-    submission_pdf = require_local_path(submission_pdf_raw) if submission_pdf_raw else None
+def payload_submission_paths(payload: dict) -> list[Path]:
+    raw_values = payload.get("submission_pdfs")
+    rows: list[str] = []
+    if isinstance(raw_values, list):
+        rows.extend(str(item).strip() for item in raw_values if str(item).strip())
+    single = str(payload.get("submission_pdf") or "").strip()
+    if single:
+        rows.append(single)
+    deduped: list[Path] = []
+    seen: set[str] = set()
+    for row in rows:
+        path = require_local_path(row)
+        key = str(path).lower()
+        if key not in seen:
+            seen.add(key)
+            deduped.append(path)
+    return deduped
+
+
+def build_grading_command(payload: dict, submission_pdf: Path, run_id: str, candidate_name: str) -> tuple[list[str], dict[str, str]]:
     question_paper_pdf_raw = str(payload.get("question_paper_pdf") or "").strip()
     question_paper_pdf = require_local_path(question_paper_pdf_raw) if question_paper_pdf_raw else None
     reference_pdf_raw = str(payload.get("reference_pdf") or "").strip()
@@ -178,7 +205,6 @@ def start_grading_task(payload: dict) -> TaskState:
     api_key = str(payload.get("api_key") or "").strip()
     questions = str(payload.get("questions") or "").strip()
     paper_id = str(payload.get("paper_id") or "local-web-paper").strip()
-    candidate_name = str(payload.get("candidate_name") or "local-candidate").strip()
     parse_only = bool(payload.get("parse_only"))
     api_mode = str(payload.get("api_mode") or "responses").strip()
     use_cache = bool(payload.get("use_cache", True))
@@ -201,8 +227,6 @@ def start_grading_task(payload: dict) -> TaskState:
     strict_official = bool(payload.get("strict_official"))
     policy_path = require_local_path(str(payload.get("policy_path") or str(DEFAULT_POLICY_PATH)))
 
-    if submission_pdf is None:
-        raise ValueError("请选择学生答卷 PDF")
     if question_paper_pdf is None:
         raise ValueError("请选择试卷题目 PDF")
     if reference_pdf is None:
@@ -214,7 +238,6 @@ def start_grading_task(payload: dict) -> TaskState:
     if model_required and not api_key:
         raise ValueError("调用模型时必须填写 API Key")
 
-    run_id = sanitize_run_id(f"web_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}")
     command = [
         sys.executable,
         str(SCRIPT_PATH),
@@ -293,17 +316,37 @@ def start_grading_task(payload: dict) -> TaskState:
     if api_key:
         env["GRADER_API_KEY"] = api_key
     env["PYTHONIOENCODING"] = "utf-8"
+    return command, env
+
+
+def start_grading_task(payload: dict) -> TaskState:
+    submission_pdfs = payload_submission_paths(payload)
+    if not submission_pdfs:
+        raise ValueError("请选择至少一份学生答卷 PDF")
+    base_candidate_name = str(payload.get("candidate_name") or "local-candidate").strip()
+    parent_run_id = sanitize_run_id(f"web_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:6]}")
+    child_run_ids = [
+        sanitize_run_id(f"{parent_run_id}_{idx:03d}_{safe_stem_for_run(path)}")
+        for idx, path in enumerate(submission_pdfs, start=1)
+    ]
 
     state = TaskState(
-        run_id=run_id,
-        command_preview=["python", "scripts/auto_grade_exam.py", "...", "--run-id", run_id],
-        output_dir=str(OUTPUT_DIR / run_id),
+        run_id=parent_run_id,
+        command_preview=["python", "scripts/auto_grade_exam.py", "...", "--batch", str(len(submission_pdfs))],
+        output_dir=str(OUTPUT_DIR),
+        batch_total=len(submission_pdfs),
+        child_run_ids=child_run_ids,
     )
     with TASK_LOCK:
-        TASKS[run_id] = state
-    thread = threading.Thread(target=run_command, args=(state, command, env), daemon=True)
+        TASKS[parent_run_id] = state
+    thread = threading.Thread(target=run_batch_command, args=(state, payload, submission_pdfs, child_run_ids, base_candidate_name), daemon=True)
     thread.start()
     return state
+
+
+def safe_stem_for_run(path: Path) -> str:
+    stem = re.sub(r"[^A-Za-z0-9_.-]", "_", path.stem.strip())
+    return stem[:28] or uuid.uuid4().hex[:8]
 
 
 def run_command(state: TaskState, command: list[str], env: dict[str, str]) -> None:
@@ -334,6 +377,106 @@ def run_command(state: TaskState, command: list[str], env: dict[str, str]) -> No
         state.status = "failed"
         state.error = f"{type(exc).__name__}: {exc}"
     finally:
+        state.process = None
+        state.finished_at = time.time()
+
+
+def run_batch_command(
+    state: TaskState,
+    payload: dict,
+    submission_pdfs: list[Path],
+    child_run_ids: list[str],
+    base_candidate_name: str,
+) -> None:
+    state.status = "running"
+    state.started_at = time.time()
+    aggregate_stdout: list[str] = []
+    aggregate_stderr: list[str] = []
+    try:
+        for idx, (submission_pdf, child_run_id) in enumerate(zip(submission_pdfs, child_run_ids), start=1):
+            if state.status == "stopping":
+                state.error = "批量任务已手动停止"
+                break
+            state.batch_index = idx
+            state.current_child_run_id = child_run_id
+            candidate_name = base_candidate_name
+            if len(submission_pdfs) > 1:
+                candidate_name = f"{base_candidate_name}-{idx:03d}-{submission_pdf.stem}"
+            command, env = build_grading_command(payload, submission_pdf, child_run_id, candidate_name)
+            state.command_preview = ["python", "scripts/auto_grade_exam.py", "...", "--run-id", child_run_id]
+            child_state = TaskState(
+                run_id=child_run_id,
+                status="running",
+                started_at=time.time(),
+                command_preview=state.command_preview,
+                output_dir=str(OUTPUT_DIR / child_run_id),
+                batch_index=idx,
+                batch_total=len(submission_pdfs),
+            )
+            with TASK_LOCK:
+                TASKS[child_run_id] = child_state
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(ROOT),
+                    env=env,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                state.process = process
+                child_state.process = process
+                stdout, stderr = process.communicate()
+                child_state.returncode = process.returncode
+                child_state.stdout = (stdout or "")[-12000:]
+                child_state.stderr = (stderr or "")[-12000:]
+                child_state.status = "finished" if process.returncode == 0 else "failed"
+                child_state.finished_at = time.time()
+                aggregate_stdout.append(f"===== {child_run_id} =====\n{stdout or ''}")
+                aggregate_stderr.append(f"===== {child_run_id} =====\n{stderr or ''}")
+                state.batch_results.append(
+                    {
+                        "run_id": child_run_id,
+                        "status": child_state.status,
+                        "submission_pdf": str(submission_pdf),
+                        "output_dir": child_state.output_dir,
+                    }
+                )
+                if process.returncode != 0:
+                    state.returncode = process.returncode
+            except Exception as exc:  # noqa: BLE001
+                child_state.status = "failed"
+                child_state.error = f"{type(exc).__name__}: {exc}"
+                child_state.finished_at = time.time()
+                state.returncode = 1
+                state.batch_results.append(
+                    {
+                        "run_id": child_run_id,
+                        "status": "failed",
+                        "submission_pdf": str(submission_pdf),
+                        "output_dir": child_state.output_dir,
+                    }
+                )
+            finally:
+                child_state.process = None
+                state.process = None
+        state.stdout = "\n".join(aggregate_stdout)[-12000:]
+        state.stderr = "\n".join(aggregate_stderr)[-12000:]
+        if state.status == "stopping":
+            state.status = "failed"
+            state.error = state.error or "批量任务已手动停止"
+        else:
+            failed = [row for row in state.batch_results if row.get("status") != "finished"]
+            state.status = "failed" if failed else "finished"
+            state.returncode = 1 if failed else 0
+    except Exception as exc:  # noqa: BLE001
+        state.status = "failed"
+        state.error = f"{type(exc).__name__}: {exc}"
+        state.returncode = 1
+    finally:
+        state.current_child_run_id = None
         state.process = None
         state.finished_at = time.time()
 
@@ -570,8 +713,8 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/upload":
                 query = parse_qs(parsed.query)
                 role = query.get("role", [""])[0]
-                uploaded = save_uploaded_pdf(self, role)
-                json_response(self, {"ok": True, "file": uploaded, "pdf_files": list_pdf_files()})
+                uploaded = save_uploaded_pdfs(self, role)
+                json_response(self, {"ok": True, "files": uploaded, "file": uploaded[0], "pdf_files": list_pdf_files()})
                 return
             if parsed.path != "/api/grade":
                 text_response(self, "Not found", status=404)
@@ -596,6 +739,11 @@ def task_to_dict(task: TaskState) -> dict:
         "stderr": task.stderr,
         "output_dir": task.output_dir,
         "error": task.error,
+        "batch_index": task.batch_index,
+        "batch_total": task.batch_total,
+        "child_run_ids": task.child_run_ids,
+        "current_child_run_id": task.current_child_run_id,
+        "batch_results": task.batch_results,
     }
 
 
@@ -793,10 +941,10 @@ INDEX_HTML = r"""<!doctype html>
       <h2>阅卷配置</h2>
       <label for="submissionPdf">学生答卷 PDF</label>
       <div class="file-row">
-        <input id="submissionUpload" type="file" accept="application/pdf,.pdf" />
-        <button class="secondary" data-upload-role="submission">导入</button>
+        <input id="submissionUpload" type="file" accept="application/pdf,.pdf" multiple />
+        <button class="secondary" data-upload-role="submission">批量导入</button>
       </div>
-      <select id="submissionPdf"></select>
+      <select id="submissionPdf" multiple size="4"></select>
       <label for="questionPaperPdf">试卷题目 PDF</label>
       <div class="file-row">
         <input id="questionPaperUpload" type="file" accept="application/pdf,.pdf" />
@@ -809,7 +957,7 @@ INDEX_HTML = r"""<!doctype html>
         <button class="secondary" data-upload-role="reference">导入</button>
       </div>
       <select id="referencePdf"></select>
-      <div class="hint" id="uploadHint">先点“导入”把本地 PDF 放入项目临时目录；MinerU/OCR 文本会在后台自动生成或复用，卷面页图会同步交给 GPT 视觉复核。</div>
+      <div class="hint" id="uploadHint">学生答卷可一次多选并批量导入；下方学生卷列表可按 Ctrl/Shift 多选，程序会按所选学生卷一张一张改。题目和答案各导入一份 PDF。</div>
       <div class="row">
         <div>
           <label for="questions">题号</label>
@@ -974,6 +1122,17 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    function selectValues(select, values) {
+      const wanted = new Set((values || []).filter(Boolean));
+      for (const option of select.options) {
+        option.selected = wanted.has(option.value);
+      }
+    }
+
+    function selectedValues(select) {
+      return Array.from(select.selectedOptions || []).map(option => option.value).filter(Boolean);
+    }
+
     async function loadFiles() {
       const data = await api("/api/files");
       $("rootHint").textContent = "项目目录：" + data.root;
@@ -985,6 +1144,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function fillSelect(select, files, preferredName) {
+      const oldValues = selectedValues(select);
       const old = select.value;
       select.innerHTML = "";
       for (const file of files) {
@@ -994,7 +1154,8 @@ INDEX_HTML = r"""<!doctype html>
         select.appendChild(option);
         if (file.name === preferredName) option.selected = true;
       }
-      if (old) select.value = old;
+      if (select.multiple && oldValues.length) selectValues(select, oldValues);
+      else if (old) select.value = old;
     }
 
     async function uploadPdf(role) {
@@ -1005,19 +1166,26 @@ INDEX_HTML = r"""<!doctype html>
       };
       const cfg = map[role];
       const fileInput = $(cfg.input);
-      const file = fileInput.files && fileInput.files[0];
-      if (!file) throw new Error(`请先选择${cfg.label} PDF`);
-      if (!file.name.toLowerCase().endsWith(".pdf")) throw new Error("只能导入 PDF 文件");
-      $("uploadHint").textContent = `正在导入 ${file.name} ...`;
+      const files = Array.from(fileInput.files || []);
+      if (!files.length) throw new Error(`请先选择${cfg.label} PDF`);
+      for (const file of files) {
+        if (!file.name.toLowerCase().endsWith(".pdf")) throw new Error("只能导入 PDF 文件");
+      }
+      $("uploadHint").textContent = `正在导入 ${files.length} 个 PDF ...`;
       const form = new FormData();
-      form.append("file", file, file.name);
+      for (const file of files) form.append("file", file, file.name);
       const data = await api("/api/upload?role=" + encodeURIComponent(role), {
         method: "POST",
         body: form
       });
       await loadFiles();
-      selectValue($(cfg.select), data.file.path);
-      $("uploadHint").textContent = `已导入 ${data.file.name}，可以继续选择其他 PDF 或开始阅卷。`;
+      const uploadedFiles = data.files || (data.file ? [data.file] : []);
+      if (role === "submission") {
+        selectValues($(cfg.select), uploadedFiles.map(file => file.path));
+      } else if (uploadedFiles[0]) {
+        selectValue($(cfg.select), uploadedFiles[0].path);
+      }
+      $("uploadHint").textContent = `已导入 ${uploadedFiles.length} 个 PDF，可以继续选择其他 PDF 或开始阅卷。`;
       fileInput.value = "";
     }
 
@@ -1025,7 +1193,20 @@ INDEX_HTML = r"""<!doctype html>
       const data = await api("/api/runs");
       const box = $("runs");
       box.innerHTML = "";
-      for (const run of data.runs.slice(0, 8)) {
+      const taskRuns = [];
+      for (const task of data.tasks || []) {
+        if ((task.child_run_ids || []).length) {
+          for (const row of task.batch_results || []) {
+            taskRuns.push({
+              run_id: row.run_id,
+              mtime: statusText(row.status),
+              has_report: row.status === "finished",
+              path: row.output_dir
+            });
+          }
+        }
+      }
+      for (const run of [...taskRuns, ...data.runs].slice(0, 8)) {
         const row = document.createElement("div");
         row.className = "run-item";
         row.innerHTML = `<div><strong>${escapeHtml(run.run_id)}</strong><div class="hint">${escapeHtml(run.mtime)} ${run.has_report ? "有报告" : "无完整报告"}</div></div>`;
@@ -1040,6 +1221,7 @@ INDEX_HTML = r"""<!doctype html>
 
     async function startGrade() {
       const payload = {
+        submission_pdfs: selectedValues($("submissionPdf")),
         submission_pdf: $("submissionPdf").value,
         question_paper_pdf: $("questionPaperPdf").value,
         reference_pdf: $("referencePdf").value,
@@ -1092,8 +1274,10 @@ INDEX_HTML = r"""<!doctype html>
         const data = await api("/api/task?run_id=" + encodeURIComponent(currentRunId));
         const task = data.task;
         setStatus(statusText(task.status), task.status);
-        $("runId").textContent = `${task.run_id} | ${task.output_dir}`;
-        await loadReportOrPartial(task.run_id);
+        const visibleRunId = task.current_child_run_id || task.child_run_ids?.[Math.max(0, (task.batch_index || 1) - 1)] || task.run_id;
+        const batchText = task.batch_total > 1 ? `批量 ${task.batch_index}/${task.batch_total} | ` : "";
+        $("runId").textContent = `${batchText}${visibleRunId} | ${task.output_dir}`;
+        await loadReportOrPartial(visibleRunId);
         if (task.status === "finished" || task.status === "failed") {
           $("startBtn").disabled = false;
           $("stopBtn").disabled = true;

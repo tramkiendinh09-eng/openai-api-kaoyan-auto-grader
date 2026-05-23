@@ -36,7 +36,7 @@ DEFAULT_VISUAL_FOCUS_DIR = ROOT / "tmp" / "auto_grading_visual_focus"
 DEFAULT_POLICY_PATH = ROOT / "config" / "kaoyan_math_grading_policy.md"
 DEFAULT_CACHE_DIR = DEFAULT_OUTPUT_DIR / "cache"
 DEFAULT_RESULT_CACHE_DIR = DEFAULT_OUTPUT_DIR / "question_result_cache"
-QUESTION_RESULT_CACHE_VERSION = "2026-05-23-strict-solution-v1"
+QUESTION_RESULT_CACHE_VERSION = "2026-05-23-strict-solution-v2"
 LOG_LOCK = threading.Lock()
 CACHE_LOCK = threading.Lock()
 RESULT_CACHE_LOCK = threading.Lock()
@@ -1328,6 +1328,9 @@ def rubric_for(item: AnswerItem, reference: dict[str, Any], strict_official: boo
                 "must_label": "推导评分点",
                 "strict_solution_caps": {
                     "final_answer_only": "cap_at_30_percent_unless official rubric explicitly gives more",
+                    "fragmentary_formula_pile": "cap_at_50_percent_unless it establishes the core chain",
+                    "one_core_scoring_point_missing": "cap_below_80_percent",
+                    "any_core_scoring_point_wrong": "cap_below_70_percent unless later work is independently correct",
                     "correct_main_idea_missing_key_conditions": "usually cap_at_70_to_80_percent",
                     "wrong_setup_or_wrong_model": "do_not_award_downstream_computation_as_if_setup_were_correct",
                     "proof_without_logical_closure": "cannot_receive_full_credit",
@@ -1349,6 +1352,7 @@ def rubric_for(item: AnswerItem, reference: dict[str, Any], strict_official: boo
             "For solution questions, do not award full credit for a correct final answer with invalid or missing reasoning.",
             "For solution questions, apply a strict Beijing-style grading scale as a non-official strict rubric: high scores require visible key steps, condition checks, and logical closure.",
             "If the student skips a key derivation, boundary/domain/condition check, proof of existence/uniqueness, distribution derivation, likelihood construction, or matrix-property justification, cap the score and name the missing point.",
+            "Do point-by-point scoring before choosing a numeric score; do not grade by overall impression.",
             "For unclear handwriting/OCR, reduce confidence and set needs_human_review when needed.",
         ],
     }
@@ -2151,6 +2155,8 @@ def build_grade_messages(
             "Only applies to solution questions. Before scoring, list the visible key steps in the student's work and compare them with inferred scoring points. "
             "A correct final answer without visible derivation cannot receive high credit. Missing theorem conditions, boundary/domain/endpoint checks, "
             "existence-uniqueness proof, integral region/limits, distribution/likelihood derivation, or matrix-property justification must be deducted. "
+            "First create a point-by-point checklist with status seen/missing/wrong/unclear. Score only from seen-and-correct points. "
+            "If any core scoring point is missing, the score should normally be below 80%; if any core setup/model/region/distribution/matrix point is wrong, it should normally be below 70%. "
             "If giving more than 80% credit, valid_student_steps/main_earned_points must show a complete core reasoning chain. "
             "If a score is capped because evidence is incomplete, state the cap reason in main_deducted_points."
         ),
@@ -2168,6 +2174,7 @@ def build_grade_messages(
             "valid_student_steps": ["string"],
             "wrong_or_missing_steps": ["string"],
             "strict_score_cap_reason": "string|null",
+            "strict_scoring_checklist": [{"point": "string", "status": "seen|missing|wrong|unclear", "impact": "string"}],
             "needs_human_review": "boolean",
             "review_reason": "string|null",
             "evidence_sources": ["string"],
@@ -2564,7 +2571,8 @@ def build_arbitration_messages(
         "strict_solution_arbitration_protocol": (
             "Only applies to solution questions. Re-score from evidence, not from the average of the first two scores. "
             "Prefer the lower score if the higher score depends on unwritten reasoning, missing key derivation, or unverified conditions. "
-            "If both prior rounds overlooked a missing boundary/domain/distribution/likelihood/matrix/proof condition, correct it and cap the score."
+            "If both prior rounds overlooked a missing boundary/domain/distribution/likelihood/matrix/proof condition, correct it and cap the score. "
+            "Use a point-by-point checklist and do not exceed 80% when a core scoring point is missing."
         ),
         "round_1": first,
         "round_2": second,
@@ -2582,6 +2590,7 @@ def build_arbitration_messages(
             "valid_student_steps": ["string"],
             "wrong_or_missing_steps": ["string"],
             "strict_score_cap_reason": "string|null",
+            "strict_scoring_checklist": [{"point": "string", "status": "seen|missing|wrong|unclear", "impact": "string"}],
             "needs_human_review": "boolean",
             "review_reason": "string|null",
             "evidence_sources": ["string"],
@@ -3036,6 +3045,7 @@ def normalize_grade(raw: dict[str, Any], item: AnswerItem, fallback_reason: str 
         "valid_student_steps": limit_list(ensure_list(raw.get("valid_student_steps"))),
         "wrong_or_missing_steps": limit_list(ensure_list(raw.get("wrong_or_missing_steps"))),
         "strict_score_cap_reason": raw.get("strict_score_cap_reason"),
+        "strict_scoring_checklist": normalize_strict_checklist(raw.get("strict_scoring_checklist")),
         "needs_human_review": needs_review,
         "review_reason": raw.get("review_reason") or (("; ".join(item.ocr_issues)) if item.needs_ocr_review and not visual_resolves_ocr else None),
         "evidence_sources": limit_list(ensure_list(raw.get("evidence_sources"))),
@@ -3068,6 +3078,9 @@ def apply_strict_solution_caps(result: dict[str, Any], item: AnswerItem) -> None
     )
     recognized = str(result.get("recognized_student_answer") or "")
     valid_steps = "；".join(ensure_list(result.get("valid_student_steps")) + ensure_list(result.get("main_earned_points")))
+    checklist = result.get("strict_scoring_checklist") if isinstance(result.get("strict_scoring_checklist"), list) else []
+    missing_core_count = sum(1 for row in checklist if str(row.get("status") or "").lower() in {"missing", "wrong", "unclear"} and is_core_checklist_point(row))
+    seen_core_count = sum(1 for row in checklist if str(row.get("status") or "").lower() == "seen" and is_core_checklist_point(row))
     cap_ratio: float | None = None
     cap_reason = ""
     severe_patterns = [
@@ -3144,6 +3157,15 @@ def apply_strict_solution_caps(result: dict[str, Any], item: AnswerItem) -> None
     if any(pattern in evidence_text for pattern in severe_patterns) or (len(compact_answer) <= 24 and not compact_valid and score_value > full_score * 0.3):
         cap_ratio = 0.3
         cap_reason = "严格大题封顶：卷面只有结论或关键推导不可见。"
+    elif missing_core_count >= 2:
+        cap_ratio = 0.65
+        cap_reason = "严格大题封顶：评分点清单显示多个核心推导点评为缺失、错误或无法辨认。"
+    elif missing_core_count == 1 and score_value > full_score * 0.8:
+        cap_ratio = 0.8
+        cap_reason = "严格大题封顶：评分点清单显示仍有一个核心推导点未被可靠写出。"
+    elif score_value > full_score * 0.85 and seen_core_count < 3:
+        cap_ratio = 0.8
+        cap_reason = "严格大题封顶：高分缺少足够数量的可见核心评分点支撑。"
     elif any(pattern in evidence_text for pattern in wrong_setup_patterns):
         cap_ratio = 0.5
         cap_reason = "严格大题封顶：建模、定限、分布、矩阵性质或主线设置存在关键错误。"
@@ -3168,6 +3190,54 @@ def apply_strict_solution_caps(result: dict[str, Any], item: AnswerItem) -> None
         max_chars=180,
     )
     result["reason"] = truncate_str((str(result.get("reason") or "") + " " + cap_reason).strip(), 260)
+
+
+def normalize_strict_checklist(value: Any) -> list[dict[str, str]]:
+    if not isinstance(value, list):
+        return []
+    rows: list[dict[str, str]] = []
+    for item in value[:8]:
+        if not isinstance(item, dict):
+            continue
+        status = str(item.get("status") or "").strip().lower()
+        if status not in {"seen", "missing", "wrong", "unclear"}:
+            status = "unclear"
+        rows.append(
+            {
+                "point": truncate_str(str(item.get("point") or ""), 120),
+                "status": status,
+                "impact": truncate_str(str(item.get("impact") or ""), 120),
+            }
+        )
+    return rows
+
+
+def is_core_checklist_point(row: dict[str, Any]) -> bool:
+    text = f"{row.get('point', '')} {row.get('impact', '')}"
+    core_markers = [
+        "核心",
+        "关键",
+        "推导",
+        "证明",
+        "条件",
+        "边界",
+        "端点",
+        "定义域",
+        "区域",
+        "上下限",
+        "分布",
+        "密度",
+        "似然",
+        "独立",
+        "特征值",
+        "特征向量",
+        "正定",
+        "合同",
+        "相似",
+        "主线",
+        "结论",
+    ]
+    return any(marker in text for marker in core_markers)
 
 
 def normalize_objective_batch_payload(raw: dict[str, Any], items: list[AnswerItem]) -> dict[str, dict[str, Any]]:
@@ -3578,6 +3648,7 @@ def combine_single_grade(item: AnswerItem, first: dict[str, Any]) -> dict[str, A
         "main_deducted_points": merge_lists(first.get("main_deducted_points")),
         "valid_student_steps": merge_lists(first.get("valid_student_steps")),
         "wrong_or_missing_steps": merge_lists(first.get("wrong_or_missing_steps")),
+        "strict_scoring_checklist": first.get("strict_scoring_checklist") or [],
     }
 
 
@@ -3827,6 +3898,7 @@ def combine_grades(
         "main_deducted_points": merge_lists(first.get("main_deducted_points"), second.get("main_deducted_points")),
         "valid_student_steps": merge_lists(first.get("valid_student_steps"), second.get("valid_student_steps")),
         "wrong_or_missing_steps": merge_lists(first.get("wrong_or_missing_steps"), second.get("wrong_or_missing_steps")),
+        "strict_scoring_checklist": merge_checklists(first.get("strict_scoring_checklist"), second.get("strict_scoring_checklist")),
     }
     if s1 is None or s2 is None:
         base["third_arbitration_triggered"] = True
@@ -3874,7 +3946,22 @@ def combine_grades(
     base["main_deducted_points"] = merge_lists(base["main_deducted_points"], third.get("main_deducted_points"))
     base["valid_student_steps"] = merge_lists(base["valid_student_steps"], third.get("valid_student_steps"))
     base["wrong_or_missing_steps"] = merge_lists(base["wrong_or_missing_steps"], third.get("wrong_or_missing_steps"))
+    base["strict_scoring_checklist"] = merge_checklists(base.get("strict_scoring_checklist"), third.get("strict_scoring_checklist"))
     return base
+
+
+def merge_checklists(*values: Any) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for value in values:
+        for row in normalize_strict_checklist(value):
+            key = (row.get("point") or "").strip()
+            if key and key not in seen:
+                seen.add(key)
+                rows.append(row)
+            if len(rows) >= 8:
+                return rows
+    return rows
 
 
 def merge_lists(*values: Any) -> list[str]:
