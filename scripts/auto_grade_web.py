@@ -25,6 +25,7 @@ UPLOAD_DIR = ROOT / "tmp" / "uploads"
 OUTPUT_DIR = ROOT / "output" / "auto_grading"
 DEFAULT_POLICY_PATH = ROOT / "config" / "kaoyan_math_grading_policy.md"
 UPLOAD_ROLES = {"submission", "question_paper", "reference"}
+DEFAULT_USER_AGENT = "Codex Desktop/0.133.0-alpha.1 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 9.41501)"
 
 
 TASKS: dict[str, "TaskState"] = {}
@@ -257,6 +258,7 @@ def build_grading_command(payload: dict, submission_pdf: Path, run_id: str, cand
     reference_pdf_raw = str(payload.get("reference_pdf") or "").strip()
     reference_pdf = require_local_path(reference_pdf_raw) if reference_pdf_raw else None
     api_url = str(payload.get("api_url") or "").strip()
+    user_agent = str(payload.get("user_agent") or DEFAULT_USER_AGENT).strip()
     model = str(payload.get("model") or "gpt-5.5").strip()
     api_key = str(payload.get("api_key") or "").strip()
     questions = str(payload.get("questions") or "").strip()
@@ -303,6 +305,8 @@ def build_grading_command(payload: dict, submission_pdf: Path, run_id: str, cand
         candidate_name,
         "--api-url",
         api_url,
+        "--user-agent",
+        user_agent,
         "--model",
         model,
         "--api-mode",
@@ -1103,6 +1107,8 @@ INDEX_HTML = r"""<!doctype html>
       </div>
       <label for="apiUrl">API URL</label>
       <input id="apiUrl" value="" placeholder="例如 https://your-gateway.example.com/v1" />
+      <label for="userAgent">请求头 User-Agent</label>
+      <input id="userAgent" value="Codex Desktop/0.133.0-alpha.1 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 9.41501)" />
       <label for="apiMode">调用方式</label>
       <select id="apiMode">
         <option value="responses" selected>/v1/responses</option>
@@ -1426,6 +1432,7 @@ INDEX_HTML = r"""<!doctype html>
         reference_pdf: $("referencePdf").value,
         questions: $("questions").value,
         api_url: $("apiUrl").value,
+        user_agent: $("userAgent").value,
         api_mode: $("apiMode").value,
         reasoning_effort: $("solutionReasoning").value,
         objective_reasoning_effort: $("objectiveReasoning").value,

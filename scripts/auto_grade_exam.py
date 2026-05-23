@@ -38,6 +38,7 @@ DEFAULT_POLICY_PATH = ROOT / "config" / "kaoyan_math_grading_policy.md"
 DEFAULT_CACHE_DIR = DEFAULT_OUTPUT_DIR / "cache"
 DEFAULT_RESULT_CACHE_DIR = DEFAULT_OUTPUT_DIR / "question_result_cache"
 QUESTION_RESULT_CACHE_VERSION = "2026-05-23-strict-solution-v3-discrete-scores"
+DEFAULT_USER_AGENT = "Codex Desktop/0.133.0-alpha.1 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 9.41501)"
 LOG_LOCK = threading.Lock()
 CACHE_LOCK = threading.Lock()
 RESULT_CACHE_LOCK = threading.Lock()
@@ -586,6 +587,7 @@ class ModelConfig:
     objective_batch_mode: bool
     single_review: bool
     use_stream: bool
+    user_agent: str
 
 
 class MineruMarkdownParser:
@@ -1430,6 +1432,7 @@ class ModelGateway:
                 objective_batch_mode=self.config.objective_batch_mode,
                 single_review=self.config.single_review,
                 use_stream=self.config.use_stream,
+                user_agent=self.config.user_agent,
             ),
             self.audit_log,
         )
@@ -1592,6 +1595,7 @@ class ModelGateway:
         headers = {
             "Authorization": f"Bearer {self.config.api_key}",
             "Content-Type": "application/json",
+            "User-Agent": self.config.user_agent or DEFAULT_USER_AGENT,
         }
         last_error: str | None = None
         degradation_limit = len(attempts)
@@ -4246,6 +4250,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None, help="Grade only the first N parsed questions after filtering.")
     parser.add_argument("--output-dir", default=str(DEFAULT_OUTPUT_DIR))
     parser.add_argument("--api-url", default=os.getenv("GRADER_API_URL", ""))
+    parser.add_argument("--user-agent", default=os.getenv("GRADER_USER_AGENT", DEFAULT_USER_AGENT), help="HTTP User-Agent used for model gateway requests.")
     parser.add_argument("--model", default=os.getenv("GRADER_MODEL", "gpt-5.5"))
     parser.add_argument("--timeout-seconds", type=int, default=int(os.getenv("GRADER_TIMEOUT_SECONDS", "420")))
     parser.add_argument("--max-retries", type=int, default=int(os.getenv("GRADER_MAX_RETRIES", "3")))
@@ -4392,6 +4397,7 @@ def main(argv: list[str]) -> int:
             "policy_path": str(policy_path) if policy_path else "",
             "policy_loaded": bool(grading_policy),
             "api_mode": args.api_mode,
+            "user_agent": args.user_agent,
             "max_output_tokens": args.max_output_tokens,
             "reasoning_effort": args.reasoning_effort,
             "objective_reasoning_effort": args.objective_reasoning_effort,
@@ -4436,6 +4442,7 @@ def main(argv: list[str]) -> int:
             objective_batch_mode=bool(args.objective_batch_mode),
             single_review=bool(args.single_review),
             use_stream=bool(args.use_stream),
+            user_agent=args.user_agent,
         ),
         audit_log=audit_log,
     )
