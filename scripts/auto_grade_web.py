@@ -595,7 +595,7 @@ def audit_progress(events: list[dict]) -> dict:
     latest_event = None
     latest_elapsed = None
     latest_error = None
-    layout_scan_status = "整卷 xhigh 视觉定位：尚未看到日志"
+    layout_scan_status = "双xhigh视觉小格定位：尚未看到日志"
     completed_calls = 0
     active_calls = 0
     for event in events:
@@ -603,11 +603,11 @@ def audit_progress(events: list[dict]) -> dict:
             continue
         name = event.get("event")
         if name == "answer_layout_scan_started":
-            layout_scan_status = "整卷 xhigh 视觉定位：已发起"
+            layout_scan_status = "双xhigh视觉小格定位：已发起"
         elif name == "answer_layout_scan_finished":
-            layout_scan_status = f"整卷 xhigh 视觉定位：已完成，定位 {event.get('located_question_count', 0)} 题"
+            layout_scan_status = f"双xhigh视觉小格定位：已完成，定位 {event.get('located_question_count', 0)} 题，答案串 {event.get('objective_answer_run_count', 0)} 组"
         elif name == "answer_layout_scan_failed":
-            layout_scan_status = "整卷 xhigh 视觉定位：失败，已改用页码启发式"
+            layout_scan_status = "双xhigh视觉小格定位：失败，已改用页码启发式"
         if name in {"visual_evidence_attached", "local_objective_grade"} and event.get("question_no"):
             latest_question = str(event.get("question_no"))
             latest_round = "准备视觉阅卷" if name == "visual_evidence_attached" else "本地客观题判分"
@@ -626,15 +626,15 @@ def audit_progress(events: list[dict]) -> dict:
             latest_event = name
         elif name == "answer_layout_scan_started":
             latest_question = "整卷"
-            latest_round = "xhigh 视觉定位作答顺序已发起"
+            latest_round = "双xhigh视觉小格定位已发起"
             latest_event = name
         elif name == "answer_layout_scan_finished":
             latest_question = "整卷"
-            latest_round = f"视觉定位完成，定位 {event.get('located_question_count', 0)} 题"
+            latest_round = f"双xhigh视觉小格定位完成，定位 {event.get('located_question_count', 0)} 题"
             latest_event = name
         elif name == "answer_layout_scan_failed":
             latest_question = "整卷"
-            latest_round = "视觉定位失败，改用旧的页码启发式"
+            latest_round = "双xhigh视觉小格定位失败，改用旧的页码启发式"
             latest_event = name
             latest_error = str(event.get("error") or "")
         elif name in {"model_cache_hit"}:
@@ -668,7 +668,7 @@ def audit_progress(events: list[dict]) -> dict:
                     latest_round += "已发起"
             elif call_name == "answer_layout_scan":
                 latest_question = "整卷"
-                latest_round = "xhigh 视觉定位作答顺序"
+                latest_round = "双xhigh视觉小格定位"
                 if name == "model_call_started":
                     latest_round += "已发起"
             latest_event = name
@@ -1145,7 +1145,7 @@ INDEX_HTML = r"""<!doctype html>
           </select>
         </div>
       </div>
-      <div class="hint">默认先用 1 次 xhigh 视觉总览定位每题作答顺序和区域；后续每题用 high 结合 MinerU OCR、局部视觉图和 PDF skill 阅卷。</div>
+      <div class="hint">默认先用 2 次 xhigh 视觉并行总览，切出选择题答案串、填空小格和大题作答框；后续每题用 high 结合 MinerU OCR 与局部视觉图阅卷。</div>
       <label for="apiKey">API Key</label>
       <input id="apiKey" type="password" placeholder="只在本地进程中用于本次调用，不写入文件" />
       <label for="policyPath">全局阅卷规范</label>
@@ -1219,7 +1219,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="metric"><strong id="reviewCount">-</strong><span>需复核</span></div>
         <div class="metric"><strong id="arbCount">-</strong><span>仲裁次数</span></div>
       </div>
-      <div id="progressBox" class="hint">整卷 xhigh 视觉定位：等待开始。等待任务开始</div>
+      <div id="progressBox" class="hint">双xhigh视觉小格定位：等待开始。等待任务开始</div>
       <div id="summary"></div>
       <div class="tabs">
         <button class="active" data-tab="table">得分表</button>
@@ -1546,7 +1546,7 @@ INDEX_HTML = r"""<!doctype html>
       const completed = report.completed_question_count ?? report.score_summary?.graded_question_count ?? (report.question_scores || []).length ?? 0;
       const total = report.total_question_count ?? "";
       const text = audit.progress?.text || "等待任务开始";
-      const layoutText = audit.progress?.layout_scan_status || "整卷 xhigh 视觉定位：等待开始";
+      const layoutText = audit.progress?.layout_scan_status || "双xhigh视觉小格定位：等待开始";
       const countText = total ? `已完成 ${completed}/${total} 题。` : "";
       $("progressBox").textContent = `${layoutText}。${countText}${text}`;
     }

@@ -16,7 +16,7 @@ import time
 import uuid
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -556,6 +556,7 @@ class AnswerLayout:
     items: dict[str, dict[str, Any]]
     global_notes: str
     source: str
+    objective_answer_runs: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -819,6 +820,9 @@ def normalized_layout_page_numbers(entry: dict[str, Any]) -> list[int]:
             raw_values.extend(value)
         elif value is not None:
             raw_values.append(value)
+    for raw_box in ensure_list_of_dicts(entry.get("answer_boxes")):
+        if raw_box.get("page_no") is not None:
+            raw_values.append(raw_box.get("page_no"))
     page_numbers: list[int] = []
     for value in raw_values:
         try:
@@ -1116,6 +1120,35 @@ def visual_payload_for_objective_batch(items: list[AnswerItem], pages: list[Visu
         "pdf_sources": sorted({page.source_pdf for page in selected[:2]}),
         "attach_pdf_file": False,
     }
+
+
+def objective_mapping_from_layout(layout: AnswerLayout | None) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    if layout is None:
+        return {}, []
+    mapping: dict[str, str] = {}
+    used_runs: list[dict[str, Any]] = []
+    for run in layout.objective_answer_runs:
+        answers = str(run.get("answers") or "").strip().upper()
+        if not answers:
+            continue
+        range_text = str(run.get("question_range") or "")
+        nums = [int(value) for value in re.findall(r"\d{1,2}", range_text)]
+        if len(nums) >= 2:
+            start, end = nums[0], nums[1]
+        elif len(nums) == 1:
+            start, end = nums[0], nums[0] + len(answers) - 1
+        else:
+            continue
+        if not (1 <= start <= end <= 10):
+            continue
+        if len(answers) < end - start + 1:
+            continue
+        for offset, question_no in enumerate(range(start, end + 1)):
+            choice = normalize_choice_letter(answers[offset])
+            if choice:
+                mapping[str(question_no)] = choice
+        used_runs.append(run)
+    return mapping, used_runs
 
 
 def visual_payload_for_layout_scan(pages: list[VisualPage]) -> dict[str, Any]:
@@ -2335,6 +2368,7 @@ def build_answer_layout_scan_messages(
     items: list[AnswerItem],
     visual_payload: dict[str, Any],
     paper_id: str,
+    scan_round: str = "A",
 ) -> list[dict[str, Any]]:
     system = (
         PROMPT_CACHE_PRIMER
@@ -2354,6 +2388,7 @@ def build_answer_layout_scan_messages(
     ]
     user_payload = {
         "task": "scan_student_answer_layout_before_grading",
+        "scan_round": scan_round,
         "paper_id": paper_id,
         "questions": questions,
         "student_answer_visual_evidence": {
@@ -2363,13 +2398,28 @@ def build_answer_layout_scan_messages(
         },
         "rules": [
             "只做定位和视觉转写辅助，不给分、不解题。",
+            "必须特别处理 1-16 小题：先判断学生是集中写答案串，还是写在每道题题旁/横线附近。",
+            "选择题若出现类似“1~5: DBACB, 6~10: ACACB”的集中答案串，必须写入 objective_answer_runs，并给出覆盖题号、答案串、裁剪框。",
+            "选择题若写在各题旁边或选项旁边，不要强行合并成答案串；为每题给出 answer_boxes 和 recognized_answer_brief。",
+            "填空题必须按题号 11-16 分小块定位，框住题目横线附近的手写最终答案；不要只给整页或整段大框。",
             "每题先找题号或学生写出的题号，再框出该题主要作答区域；跨页续写时给多个框。",
             "answer_boxes 使用相对坐标 [x1,y1,x2,y2]，范围 0-1，覆盖学生作答，不要只框题号。",
+            "对小题，answer_boxes 应尽量紧贴最终答案区域，避免把相邻题作答框进去。",
             "若题号顺序与卷面顺序不同，is_out_of_order=true，并在 notes 说明。",
             "看不清或不能确定位置时仍返回该题，但 page_numbers=[]、confidence 低、needs_human_review=true。",
             "不要把题目 PDF 或参考答案当成学生作答；这里只看学生答卷。",
         ],
         "required_output_schema": {
+            "objective_answer_runs": [
+                {
+                    "question_range": "string, e.g. 1-5",
+                    "answers": "string, e.g. DBACB",
+                    "page_no": "number",
+                    "box": ["x1", "y1", "x2", "y2"],
+                    "confidence": "number between 0 and 1",
+                    "notes": "string",
+                }
+            ],
             "items": [
                 {
                     "question_no": "string",
@@ -2423,23 +2473,34 @@ def scan_answer_layout(
         },
     )
     try:
-        raw = layout_gateway.call_json(
-            build_answer_layout_scan_messages(items, visual_payload, paper_id),
-            "answer_layout_scan",
-        )
-        layout = normalize_answer_layout(raw, items)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first_future = executor.submit(
+                layout_gateway.call_json,
+                build_answer_layout_scan_messages(items, visual_payload, paper_id, scan_round="A"),
+                "answer_layout_scan_A",
+            )
+            second_future = executor.submit(
+                layout_gateway.call_json,
+                build_answer_layout_scan_messages(items, visual_payload, paper_id, scan_round="B"),
+                "answer_layout_scan_B",
+            )
+            first_layout = normalize_answer_layout(first_future.result(), items, source="model_whole_submission_visual_scan_A")
+            second_layout = normalize_answer_layout(second_future.result(), items, source="model_whole_submission_visual_scan_B")
+        layout = merge_answer_layouts(first_layout, second_layout, items)
         append_jsonl(
             audit_log,
             {
                 "event": "answer_layout_scan_finished",
                 "time": utc_now(),
                 "located_question_count": sum(1 for entry in layout.items.values() if normalized_layout_page_numbers(entry)),
+                "objective_answer_run_count": len(layout.objective_answer_runs),
                 "low_confidence_questions": [
                     question_no
                     for question_no, entry in layout.items.items()
                     if layout_entry_confidence(entry) < 0.55 or entry.get("needs_human_review")
                 ],
                 "global_notes": layout.global_notes,
+                "source": layout.source,
             },
         )
         return layout
@@ -2455,7 +2516,7 @@ def scan_answer_layout(
         return None
 
 
-def normalize_answer_layout(raw: dict[str, Any], items: list[AnswerItem]) -> AnswerLayout:
+def normalize_answer_layout(raw: dict[str, Any], items: list[AnswerItem], source: str = "model_whole_submission_visual_scan") -> AnswerLayout:
     raw = repair_text_encoding(raw)
     raw_items = raw.get("items")
     if not isinstance(raw_items, list):
@@ -2520,8 +2581,99 @@ def normalize_answer_layout(raw: dict[str, Any], items: list[AnswerItem]) -> Ans
     return AnswerLayout(
         items=layout_items,
         global_notes=truncate_str(str(raw.get("global_notes") or ""), 500),
-        source="model_whole_submission_visual_scan",
+        source=source,
+        objective_answer_runs=normalize_objective_answer_runs(raw.get("objective_answer_runs")),
     )
+
+
+def normalize_objective_answer_runs(value: Any) -> list[dict[str, Any]]:
+    runs: list[dict[str, Any]] = []
+    if not isinstance(value, list):
+        return runs
+    for row in value[:6]:
+        if not isinstance(row, dict):
+            continue
+        answers = re.sub(r"[^A-Da-d]", "", str(row.get("answers") or "")).upper()
+        if not answers:
+            continue
+        box = normalize_ratio_box(row.get("box"))
+        page_no = safe_int_or_none(row.get("page_no"))
+        try:
+            confidence = max(0.0, min(1.0, float(row.get("confidence", 0.0))))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        runs.append(
+            {
+                "question_range": truncate_str(str(row.get("question_range") or ""), 40),
+                "answers": answers[:10],
+                "page_no": page_no,
+                "box": list(box) if box else [],
+                "confidence": confidence,
+                "notes": truncate_str(str(row.get("notes") or ""), 120),
+            }
+        )
+    return runs
+
+
+def merge_answer_layouts(first: AnswerLayout, second: AnswerLayout, items: list[AnswerItem]) -> AnswerLayout:
+    merged: dict[str, dict[str, Any]] = {}
+    for item in items:
+        a = first.items.get(item.question_no, {})
+        b = second.items.get(item.question_no, {})
+        chosen = dict(a if layout_entry_confidence(a) >= layout_entry_confidence(b) else b)
+        same_pages = normalized_layout_page_numbers(a) == normalized_layout_page_numbers(b)
+        same_brief = compact_answer_text(a.get("recognized_answer_brief")) == compact_answer_text(b.get("recognized_answer_brief"))
+        if not same_pages or (item.question_type in {"objective", "blank"} and not same_brief):
+            chosen["confidence"] = min(layout_entry_confidence(chosen), 0.58)
+            chosen["needs_human_review"] = True
+            chosen["notes"] = truncate_str(
+                (str(chosen.get("notes") or "") + "；双xhigh视觉扫描不一致，需后续单题视觉复核。").strip("；"),
+                220,
+            )
+        chosen["layout_rounds"] = {
+            "A": stable_layout_entry(item.question_no, a),
+            "B": stable_layout_entry(item.question_no, b),
+        }
+        merged[item.question_no] = chosen
+    objective_runs = merge_objective_answer_runs(first.objective_answer_runs, second.objective_answer_runs)
+    notes = "；".join(value for value in [first.global_notes, second.global_notes] if value)
+    return AnswerLayout(
+        items=merged,
+        global_notes=truncate_str(notes, 500),
+        source="dual_xhigh_visual_scan_merged",
+        objective_answer_runs=objective_runs,
+    )
+
+
+def compact_answer_text(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "")).upper()
+
+
+def merge_objective_answer_runs(first: list[dict[str, Any]], second: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for run in [*first, *second]:
+        key = f"{run.get('question_range')}:{run.get('answers')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        matching = [
+            other
+            for other in [*first, *second]
+            if other is not run
+            and str(other.get("question_range") or "") == str(run.get("question_range") or "")
+            and str(other.get("answers") or "") == str(run.get("answers") or "")
+        ]
+        row = dict(run)
+        if matching:
+            row["confidence"] = max(float(row.get("confidence") or 0), float(matching[0].get("confidence") or 0))
+            row["verified_by_dual_scan"] = True
+        else:
+            row["confidence"] = min(float(row.get("confidence") or 0), 0.62)
+            row["verified_by_dual_scan"] = False
+            row["notes"] = truncate_str((str(row.get("notes") or "") + "；仅一轮xhigh读到该答案串。").strip("；"), 120)
+        rows.append(row)
+    return rows[:6]
 
 
 def safe_int_or_none(value: Any) -> int | None:
@@ -3763,9 +3915,57 @@ def grade_objective_batch_for_run(
     paper_id: str,
     strict_official: bool,
     visual_pages: list[VisualPage],
+    answer_layout: AnswerLayout | None = None,
 ) -> list[dict[str, Any]]:
     if not items:
         return []
+    layout_mapping, layout_runs = objective_mapping_from_layout(answer_layout)
+    if layout_mapping and all(item.question_no in layout_mapping for item in items):
+        references = {item.question_no: reference_bank.get(item.question_no) for item in items}
+        first_by_no = {
+            item.question_no: {
+                "question_no": item.question_no,
+                "full_score": item.full_score,
+                "score": None,
+                "student_choice": layout_mapping.get(item.question_no),
+                "reference_choice": extract_objective_choice(str(references[item.question_no].get("reference_text") or ""), item.question_no),
+                "recognized_student_answer": layout_mapping.get(item.question_no) or "",
+                "visual_reading_summary": "双xhigh视觉预读识别到选择题集中答案串：" + "；".join(
+                    f"{run.get('question_range')}:{run.get('answers')}" for run in layout_runs
+                ),
+                "evidence_used": "visual",
+                "needs_human_review": any(not bool(run.get("verified_by_dual_scan")) for run in layout_runs),
+                "review_reason": None,
+                "confidence": min([float(run.get("confidence") or 0.0) for run in layout_runs] or [0.0]),
+                "main_earned_points": [],
+                "main_deducted_points": [],
+                "valid_student_steps": [f"双xhigh视觉预读选项：{layout_mapping.get(item.question_no)}"],
+                "wrong_or_missing_steps": [],
+                "reason": "选择题由双xhigh视觉预读答案串本地精确判分。",
+            }
+            for item in items
+        }
+        results = [
+            combine_single_grade(item, grade_objective_choices_from_reading(first_by_no, [item], references, strict_official)[item.question_no])
+            for item in items
+        ]
+        for result in results:
+            result["grading_round_1"] = first_by_no.get(result["question_no"])
+            result["grading_round_2"] = None
+            result["grading_round_3"] = None
+            result["scoring_engine"] = "dual_xhigh_layout_objective_answer_runs"
+            result["visual_sources"] = {"enabled": True, "selection_reason": "dual_xhigh_objective_answer_runs", "objective_answer_runs": layout_runs}
+            result["reference_sources"] = reference_bank.get(result["question_no"]).get("sources", [])
+        append_jsonl(
+            gateway.audit_log,
+            {
+                "event": "objective_batch_dual_layout_short_circuit",
+                "time": utc_now(),
+                "question_nos": [item.question_no for item in items],
+                "objective_answer_runs": layout_runs,
+            },
+        )
+        return results
     visual_payload = visual_payload_for_objective_batch(items, visual_pages)
     local_results = fallback_objective_batch_grade(
         items,
@@ -4463,6 +4663,7 @@ def main(argv: list[str]) -> int:
             "available": answer_layout is not None,
             "source": answer_layout.source if answer_layout else "",
             "global_notes": answer_layout.global_notes if answer_layout else "",
+            "objective_answer_runs": answer_layout.objective_answer_runs if answer_layout else [],
             "items": answer_layout.items if answer_layout else {},
         },
     )
@@ -4534,6 +4735,7 @@ def main(argv: list[str]) -> int:
                     args.paper_id,
                     bool(args.strict_official),
                     visual_pages,
+                    answer_layout,
                 )
             ] = objective_items
         for item in extra_objective_items:
