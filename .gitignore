@@ -1,0 +1,43 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# Runtime outputs, caches, OCR extracts, and local logs
+output/
+tmp/
+tmp_*/
+tmp_*.json
+tmp_*.txt
+_*.txt
+*.log
+*.jsonl
+
+# This repository only publishes the auto-grading prototype scripts.
+scripts/*.py
+!scripts/auto_grade_exam.py
+!scripts/auto_grade_web.py
+
+# Exam/private source materials and generated render artifacts
+*.pdf
+*.zip
+*.png
+*.jpg
+*.jpeg
+*.webp
+*.tex
+*_pdfpath*.txt
+tmp_*.txt
+考情分析/
+考研数学一、二、三历年真题（1987-2026年）/
+2023-2026精选模拟卷大全.md
+
+# Local secrets
+.env
+.env.*
+*.key
+secrets.*
