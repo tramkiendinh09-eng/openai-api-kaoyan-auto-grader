@@ -36,7 +36,7 @@ DEFAULT_VISUAL_FOCUS_DIR = ROOT / "tmp" / "auto_grading_visual_focus"
 DEFAULT_POLICY_PATH = ROOT / "config" / "kaoyan_math_grading_policy.md"
 DEFAULT_CACHE_DIR = DEFAULT_OUTPUT_DIR / "cache"
 DEFAULT_RESULT_CACHE_DIR = DEFAULT_OUTPUT_DIR / "question_result_cache"
-QUESTION_RESULT_CACHE_VERSION = "2026-05-23-layout-scan-v1"
+QUESTION_RESULT_CACHE_VERSION = "2026-05-23-strict-solution-v1"
 LOG_LOCK = threading.Lock()
 CACHE_LOCK = threading.Lock()
 RESULT_CACHE_LOCK = threading.Lock()
@@ -50,10 +50,12 @@ PROMPT_CACHE_PRIMER = """
 4. 选择题只读取学生最终 A/B/C/D，不解题、不按过程给分；参考答案一致给满分，不一致给 0 分。
 5. 填空题按最终结果及数学等价形式判分，不能把印刷横线、题目文本或参考答案当作学生答案。
 6. 解答题必须按步骤给分，不能只看最终答案；方法不同但逻辑严谨、数学等价的，应按评分点给分。
-7. 过程错误但结论偶然正确，不能给满分；中间步骤正确但最后计算错，应给相应部分分。
-8. 未给出官方细则时，只能从本次参考解析推导评分点，并在结果中标明“推导评分点”，不得伪装成官方评分标准。
-9. 输出必须是可解析 JSON；分数字段必须是数字或 null；不要输出 Markdown、自然语言前后缀或多余解释。
-10. 置信度反映证据质量：卷面清楚且参考答案充分时较高；字迹不清、OCR 缺失、页图覆盖不足或推导评分点较多时降低。
+7. 大题采用严格阅卷口径：没有可见推导证据的结论不得高分；关键步骤缺失、定理条件未验、边界/端点/定义域/分布条件/矩阵性质未说明时必须扣关键分。
+8. 过程错误但结论偶然正确，不能给满分；中间步骤正确但最后计算错，应给相应部分分。
+9. 对证明题和多问大题，必须检查逻辑闭合与前后问依赖；前问主线错误会影响后问得分。
+10. 未给出官方细则时，只能从本次参考解析推导评分点，并在结果中标明“推导评分点”，不得伪装成官方评分标准。
+11. 输出必须是可解析 JSON；分数字段必须是数字或 null；不要输出 Markdown、自然语言前后缀或多余解释。
+12. 置信度反映证据质量：卷面清楚且参考答案充分时较高；字迹不清、OCR 缺失、页图覆盖不足或推导评分点较多时降低。
 """.strip()
 
 
@@ -1318,9 +1320,18 @@ def rubric_for(item: AnswerItem, reference: dict[str, Any], strict_official: boo
             {
                 "point_id": f"{item.question_no}-step-rubric",
                 "score": item.full_score,
-                "description": "Solution question: infer stepwise scoring points from the reference solution. Mark every inferred point as inferred.",
+                "description": (
+                    "Solution question: infer strict stepwise scoring points from the reference solution. "
+                    "Mark every inferred point as inferred. Award high scores only when visible student work supports the core reasoning chain."
+                ),
                 "source_type": "inferred_from_reference" if not reference.get("is_official") else "inferred_from_official_analysis",
                 "must_label": "推导评分点",
+                "strict_solution_caps": {
+                    "final_answer_only": "cap_at_30_percent_unless official rubric explicitly gives more",
+                    "correct_main_idea_missing_key_conditions": "usually cap_at_70_to_80_percent",
+                    "wrong_setup_or_wrong_model": "do_not_award_downstream_computation_as_if_setup_were_correct",
+                    "proof_without_logical_closure": "cannot_receive_full_credit",
+                },
             }
         ]
 
@@ -1336,6 +1347,8 @@ def rubric_for(item: AnswerItem, reference: dict[str, Any], strict_official: boo
             "Do not invent official scoring rules.",
             "If a step score is inferred from a solution, label it as 推导评分点.",
             "For solution questions, do not award full credit for a correct final answer with invalid or missing reasoning.",
+            "For solution questions, apply a strict Beijing-style grading scale as a non-official strict rubric: high scores require visible key steps, condition checks, and logical closure.",
+            "If the student skips a key derivation, boundary/domain/condition check, proof of existence/uniqueness, distribution derivation, likelihood construction, or matrix-property justification, cap the score and name the missing point.",
             "For unclear handwriting/OCR, reduce confidence and set needs_human_review when needed.",
         ],
     }
@@ -2091,6 +2104,7 @@ def build_grade_messages(
         "你是考研数学阅卷专家。你只能依据输入中的参考答案、考试分析、评分标准和明确标记的推导评分点评分。"
         "不得把推导评分点伪装成官方标准。若依据不足、OCR不清或无法判断，必须设置 needs_human_review=true。"
         "选择题按最终选项判分；填空题按结果及数学等价性判分；解答题必须按步骤给分，不能只看最终答案。"
+        "大题必须采用严格口径：高分需要卷面可见的关键推导、条件检查和逻辑闭合；只写答案、跳过核心步骤或边界条件未检时必须封顶扣分。"
         "输出必须是合法 JSON，不要输出 Markdown。"
     )
     compact_policy = grading_policy
@@ -2133,6 +2147,13 @@ def build_grade_messages(
             "For blank questions, printed answer lines are not part of the student's answer; do not treat the underline "
             "before or under a handwritten expression as a minus sign."
         ),
+        "strict_solution_grading_protocol": (
+            "Only applies to solution questions. Before scoring, list the visible key steps in the student's work and compare them with inferred scoring points. "
+            "A correct final answer without visible derivation cannot receive high credit. Missing theorem conditions, boundary/domain/endpoint checks, "
+            "existence-uniqueness proof, integral region/limits, distribution/likelihood derivation, or matrix-property justification must be deducted. "
+            "If giving more than 80% credit, valid_student_steps/main_earned_points must show a complete core reasoning chain. "
+            "If a score is capped because evidence is incomplete, state the cap reason in main_deducted_points."
+        ),
         "required_output_schema": {
             "question_no": "string",
             "full_score": "number",
@@ -2146,6 +2167,7 @@ def build_grade_messages(
             "main_deducted_points": ["string"],
             "valid_student_steps": ["string"],
             "wrong_or_missing_steps": ["string"],
+            "strict_score_cap_reason": "string|null",
             "needs_human_review": "boolean",
             "review_reason": "string|null",
             "evidence_sources": ["string"],
@@ -2157,6 +2179,7 @@ def build_grade_messages(
             "max_chars_per_list_item": 80,
             "max_reason_chars": 160,
             "style": "Concise Chinese. Do not repeat the same point in several fields.",
+            "solution_question_style": "Strict. Name missing inferred scoring points explicitly; do not give comfort points for unwritten reasoning.",
         },
     }
     if visual_payload and "stable_pages" in visual_payload:
@@ -2503,7 +2526,7 @@ def build_arbitration_messages(
         PROMPT_CACHE_PRIMER
         + "\n\n"
         "你是考研数学第三次仲裁阅卷员。你的任务是重新检查学生答案、评分依据和前两次评分差异。"
-        "不要简单折中或投票；必须按评分点重新判断。输出必须是合法 JSON。"
+        "不要简单折中或投票；必须按评分点重新判断。大题按严格口径仲裁：没有可见关键步骤不能高分，关键条件或证明闭合缺失必须扣分。输出必须是合法 JSON。"
     )
     compact_policy = grading_policy
     compact_question_reference = question_reference
@@ -2538,6 +2561,11 @@ def build_arbitration_messages(
             "For blank questions, printed answer lines are not part of the student's answer; do not treat the underline "
             "before or under a handwritten expression as a minus sign."
         ),
+        "strict_solution_arbitration_protocol": (
+            "Only applies to solution questions. Re-score from evidence, not from the average of the first two scores. "
+            "Prefer the lower score if the higher score depends on unwritten reasoning, missing key derivation, or unverified conditions. "
+            "If both prior rounds overlooked a missing boundary/domain/distribution/likelihood/matrix/proof condition, correct it and cap the score."
+        ),
         "round_1": first,
         "round_2": second,
         "required_output_schema": {
@@ -2553,6 +2581,7 @@ def build_arbitration_messages(
             "main_deducted_points": ["string"],
             "valid_student_steps": ["string"],
             "wrong_or_missing_steps": ["string"],
+            "strict_score_cap_reason": "string|null",
             "needs_human_review": "boolean",
             "review_reason": "string|null",
             "evidence_sources": ["string"],
@@ -2993,7 +3022,7 @@ def normalize_grade(raw: dict[str, Any], item: AnswerItem, fallback_reason: str 
     needs_review = bool(raw.get("needs_human_review", score is None))
     if item.needs_ocr_review and not visual_resolves_ocr:
         needs_review = True
-    return {
+    result = {
         "question_no": str(raw.get("question_no") or item.question_no),
         "full_score": item.full_score,
         "score": score,
@@ -3006,12 +3035,139 @@ def normalize_grade(raw: dict[str, Any], item: AnswerItem, fallback_reason: str 
         "main_deducted_points": limit_list(ensure_list(raw.get("main_deducted_points"))),
         "valid_student_steps": limit_list(ensure_list(raw.get("valid_student_steps"))),
         "wrong_or_missing_steps": limit_list(ensure_list(raw.get("wrong_or_missing_steps"))),
+        "strict_score_cap_reason": raw.get("strict_score_cap_reason"),
         "needs_human_review": needs_review,
         "review_reason": raw.get("review_reason") or (("; ".join(item.ocr_issues)) if item.needs_ocr_review and not visual_resolves_ocr else None),
         "evidence_sources": limit_list(ensure_list(raw.get("evidence_sources"))),
         "confidence": confidence,
         "reason": truncate_str(raw.get("reason") or fallback_reason, 260),
     }
+    apply_strict_solution_caps(result, item)
+    return result
+
+
+def apply_strict_solution_caps(result: dict[str, Any], item: AnswerItem) -> None:
+    if item.question_type != "solution":
+        return
+    score = result.get("score")
+    if score is None:
+        return
+    try:
+        score_value = float(score)
+    except (TypeError, ValueError):
+        return
+    full_score = float(item.full_score or 0)
+    if full_score <= 0:
+        return
+    evidence_text = "；".join(
+        ensure_list(result.get("deducted_points"))
+        + ensure_list(result.get("main_deducted_points"))
+        + ensure_list(result.get("wrong_or_missing_steps"))
+        + ensure_list(result.get("strict_score_cap_reason"))
+        + ensure_list(result.get("reason"))
+    )
+    recognized = str(result.get("recognized_student_answer") or "")
+    valid_steps = "；".join(ensure_list(result.get("valid_student_steps")) + ensure_list(result.get("main_earned_points")))
+    cap_ratio: float | None = None
+    cap_reason = ""
+    severe_patterns = [
+        "只有最终答案",
+        "仅有最终答案",
+        "只写答案",
+        "无推导",
+        "没有推导",
+        "缺少推导",
+        "过程缺失",
+        "未见过程",
+        "空白",
+    ]
+    key_missing_patterns = [
+        "关键步骤缺失",
+        "缺少关键",
+        "未证明",
+        "没有证明",
+        "未讨论",
+        "没有讨论",
+        "边界未",
+        "未检边界",
+        "未查边界",
+        "缺少边界",
+        "没有比较边界",
+        "端点未",
+        "未检端点",
+        "缺少端点",
+        "定义域未",
+        "缺少定义域",
+        "条件未",
+        "未说明条件",
+        "积分区域未",
+        "缺少积分区域",
+        "上下限未",
+        "缺少上下限",
+        "漏乘雅可比",
+        "缺少雅可比",
+        "法向未",
+        "方向未",
+        "收敛性未",
+        "缺少收敛性",
+        "未证存在唯一",
+        "缺少存在唯一",
+        "充分必要性未",
+        "未构造似然函数",
+        "缺少似然函数",
+        "未推导分布函数",
+        "缺少分布函数",
+        "未写概率密度",
+        "独立同分布未",
+        "未说明独立同分布",
+        "未证明特征值",
+        "缺少特征值",
+        "未求特征向量",
+        "正定性未",
+        "合同条件未",
+        "相似条件未",
+    ]
+    wrong_setup_patterns = [
+        "主线错误",
+        "建模错误",
+        "设定错误",
+        "公式错误",
+        "区域错误",
+        "上下限错误",
+        "似然函数不正确",
+        "分布函数不正确",
+        "矩阵性质错误",
+        "概念混淆",
+    ]
+    compact_answer = re.sub(r"\s+", "", recognized)
+    compact_valid = re.sub(r"\s+", "", valid_steps)
+    if any(pattern in evidence_text for pattern in severe_patterns) or (len(compact_answer) <= 24 and not compact_valid and score_value > full_score * 0.3):
+        cap_ratio = 0.3
+        cap_reason = "严格大题封顶：卷面只有结论或关键推导不可见。"
+    elif any(pattern in evidence_text for pattern in wrong_setup_patterns):
+        cap_ratio = 0.5
+        cap_reason = "严格大题封顶：建模、定限、分布、矩阵性质或主线设置存在关键错误。"
+    elif any(pattern in evidence_text for pattern in key_missing_patterns):
+        cap_ratio = 0.78
+        cap_reason = "严格大题封顶：缺少关键条件检查、证明闭合、边界/端点/区域/分布等推导评分点。"
+    if cap_ratio is None:
+        return
+    cap_score = round(full_score * cap_ratio, 2)
+    if score_value <= cap_score:
+        return
+    result["score"] = cap_score
+    result["confidence"] = min(float(result.get("confidence") or 0.0), 0.78)
+    result["main_deducted_points"] = limit_list(
+        ensure_list(result.get("main_deducted_points")) + [cap_reason],
+        max_items=4,
+        max_chars=180,
+    )
+    result["wrong_or_missing_steps"] = limit_list(
+        ensure_list(result.get("wrong_or_missing_steps")) + ["按严格解答题口径，高分必须有可见关键步骤支撑。"],
+        max_items=4,
+        max_chars=180,
+    )
+    result["reason"] = truncate_str((str(result.get("reason") or "") + " " + cap_reason).strip(), 260)
 
 
 def normalize_objective_batch_payload(raw: dict[str, Any], items: list[AnswerItem]) -> dict[str, dict[str, Any]]:
@@ -4082,7 +4238,7 @@ def main(argv: list[str]) -> int:
     visual_pages = render_pdf_pages(submission_pdf_paths, run_dir=run_dir, audit_log=audit_log) if submission_pdf_paths else []
     write_json(run_dir / "visual_pages.json", [asdict(page) for page in visual_pages])
     policy_path = Path(args.policy_path) if args.policy_path else None
-    grading_policy = read_optional_text(policy_path, limit=5500)
+    grading_policy = read_optional_text(policy_path, limit=12000)
     cache_enabled = bool(args.use_cache) and not bool(args.no_cache)
     write_json(
         run_dir / "reference_index.json",
