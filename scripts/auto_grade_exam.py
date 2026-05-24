@@ -37,14 +37,77 @@ DEFAULT_VISUAL_FOCUS_DIR = ROOT / "tmp" / "auto_grading_visual_focus"
 DEFAULT_POLICY_PATH = ROOT / "config" / "kaoyan_math_grading_policy.md"
 DEFAULT_CACHE_DIR = DEFAULT_OUTPUT_DIR / "cache"
 DEFAULT_RESULT_CACHE_DIR = DEFAULT_OUTPUT_DIR / "question_result_cache"
-QUESTION_RESULT_CACHE_VERSION = "2026-05-23-strict-solution-v3-discrete-scores"
+QUESTION_RESULT_CACHE_VERSION = "2026-05-24-strict-solution-v4-evidence-routing"
 DEFAULT_USER_AGENT = "Codex Desktop/0.133.0-alpha.1 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 9.41501)"
 LOG_LOCK = threading.Lock()
 CACHE_LOCK = threading.Lock()
 RESULT_CACHE_LOCK = threading.Lock()
 UNLOCATED_BY_LAYOUT_REASON = "双xhigh整卷布局扫描未定位到本题题号或相邻题号；禁止使用固定页码裁剪，需人工复核完整答卷。"
-LAYOUT_SCAN_MAX_OUTPUT_TOKENS = 12000
-LAYOUT_SCAN_COMPACT_MAX_OUTPUT_TOKENS = 5000
+LAYOUT_SCAN_MAX_OUTPUT_TOKENS = 7000
+LAYOUT_SCAN_COMPACT_MAX_OUTPUT_TOKENS = 4500
+LAYOUT_SCAN_PAGES_PER_CHUNK = 1
+LAYOUT_SCAN_CHUNK_OVERLAP = 0
+LAYOUT_SCAN_A_PARALLEL_CHUNKS = 3
+LAYOUT_SCAN_B_PARALLEL_GROUPS = 3
+LAYOUT_SCAN_B_RETRY_GROUP_SIZE = 3
+LAYOUT_SCAN_B_SINGLE_RETRY_LIMIT = 8
+LAYOUT_SCAN_MAX_BOXES_PER_QUESTION = 6
+STREAM_TOTAL_TIMEOUT_LAYOUT_SECONDS = int(os.getenv("GRADER_STREAM_TOTAL_TIMEOUT_LAYOUT_SECONDS", "180"))
+STREAM_TOTAL_TIMEOUT_FOCUS_SECONDS = int(os.getenv("GRADER_STREAM_TOTAL_TIMEOUT_FOCUS_SECONDS", "150"))
+STREAM_TOTAL_TIMEOUT_DEFAULT_SECONDS = int(os.getenv("GRADER_STREAM_TOTAL_TIMEOUT_DEFAULT_SECONDS", "240"))
+ENDPOINT_FAILURE_THRESHOLD = int(os.getenv("GRADER_ENDPOINT_FAILURE_THRESHOLD", "12"))
+ENDPOINT_CIRCUIT_COOLDOWN_SECONDS = int(os.getenv("GRADER_ENDPOINT_CIRCUIT_COOLDOWN_SECONDS", "240"))
+
+
+class StreamingResponseInterrupted(RuntimeError):
+    def __init__(self, message: str, partial_text: str) -> None:
+        super().__init__(message)
+        self.partial_text = partial_text
+
+
+ENDPOINT_CIRCUIT_LOCK = threading.Lock()
+ENDPOINT_CIRCUITS: dict[str, dict[str, Any]] = {}
+
+
+def endpoint_circuit_block_reason(endpoint: str) -> str | None:
+    if ENDPOINT_FAILURE_THRESHOLD <= 0:
+        return None
+    with ENDPOINT_CIRCUIT_LOCK:
+        state = ENDPOINT_CIRCUITS.get(endpoint)
+        if not state:
+            return None
+        opened_at = float(state.get("opened_at") or 0.0)
+        if not opened_at:
+            return None
+        elapsed = time.monotonic() - opened_at
+        if elapsed >= ENDPOINT_CIRCUIT_COOLDOWN_SECONDS:
+            ENDPOINT_CIRCUITS.pop(endpoint, None)
+            return None
+        return (
+            f"Endpoint circuit open after {state.get('count', 0)} consecutive failures; "
+            f"cooldown {int(max(0, ENDPOINT_CIRCUIT_COOLDOWN_SECONDS - elapsed))}s; "
+            f"last_error={state.get('last_error', '')}"
+        )
+
+
+def record_endpoint_success(endpoint: str) -> None:
+    if ENDPOINT_FAILURE_THRESHOLD <= 0:
+        return
+    with ENDPOINT_CIRCUIT_LOCK:
+        ENDPOINT_CIRCUITS.pop(endpoint, None)
+
+
+def record_endpoint_failure(endpoint: str, error: str) -> bool:
+    if ENDPOINT_FAILURE_THRESHOLD <= 0:
+        return False
+    with ENDPOINT_CIRCUIT_LOCK:
+        state = ENDPOINT_CIRCUITS.setdefault(endpoint, {"count": 0, "last_error": "", "opened_at": 0.0})
+        state["count"] = int(state.get("count") or 0) + 1
+        state["last_error"] = truncate_str(str(error), 240) if "truncate_str" in globals() else str(error)[:240]
+        if state["count"] >= ENDPOINT_FAILURE_THRESHOLD and not state.get("opened_at"):
+            state["opened_at"] = time.monotonic()
+            return True
+    return False
 
 PROMPT_CACHE_PRIMER = """
 【考研数学阅卷固定协议】
@@ -934,7 +997,7 @@ def focus_box_specs_from_layout(item: AnswerItem, layout: AnswerLayout | None) -
         return []
     confidence = layout_entry_confidence(entry)
     specs: list[dict[str, Any]] = []
-    for idx, raw_box in enumerate(raw_boxes[:3], start=1):
+    for idx, raw_box in enumerate(raw_boxes[:LAYOUT_SCAN_MAX_BOXES_PER_QUESTION], start=1):
         if not isinstance(raw_box, dict):
             continue
         box = normalize_ratio_box(raw_box.get("box"))
@@ -1105,7 +1168,7 @@ def visual_payload_for_item(
     if layout_unlocated and isinstance(layout_entry, dict):
         page_values = normalized_layout_page_numbers(layout_entry)
         layout_unlocated = not page_values and not ensure_list(layout_entry.get("answer_boxes"))
-    return {
+    payload = {
         "enabled": bool(selected),
         "selection_reason": (
             "layout_scan_guided_pdf_vision"
@@ -1127,6 +1190,8 @@ def visual_payload_for_item(
         "layout_unlocated": layout_unlocated,
         "layout_unlocated_reason": UNLOCATED_BY_LAYOUT_REASON if layout_unlocated else "",
     }
+    payload["evidence_state"] = evidence_state_for_item(item, payload)
+    return payload
 
 
 def focused_visual_payload(visual_payload: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -1146,6 +1211,69 @@ def focused_visual_payload(visual_payload: dict[str, Any] | None) -> dict[str, A
         "pdf_sources": pdf_sources,
         "attach_pdf_file": False,
         "layout_scan": visual_payload.get("layout_scan"),
+        "evidence_state": visual_payload.get("evidence_state"),
+    }
+
+
+def evidence_state_for_item(item: AnswerItem, visual_payload: dict[str, Any] | None) -> dict[str, Any]:
+    visual_payload = visual_payload or {}
+    layout_scan = visual_payload.get("layout_scan") if isinstance(visual_payload.get("layout_scan"), dict) else {}
+    layout_rounds = layout_scan.get("layout_rounds") if isinstance(layout_scan.get("layout_rounds"), dict) else {}
+    has_layout_pages = bool(layout_scan.get("page_numbers") or layout_scan.get("answer_boxes"))
+    has_focus = bool(visual_payload.get("focus_pages"))
+    has_pages = bool(visual_payload.get("pages") or visual_payload.get("focus_pages"))
+    b_round = layout_rounds.get("B")
+    b_verified = isinstance(b_round, dict) and bool(
+        b_round.get("verified_no_delta")
+        or b_round.get("b_verification_covered")
+        or b_round.get("page_numbers")
+        or b_round.get("answer_boxes")
+    )
+    b_failed = isinstance(b_round, dict) and bool(
+        b_round.get("verification_failed") or b_round.get("b_verification_failed")
+    )
+    layout_confidence = 0.0
+    with contextlib.suppress(Exception):
+        layout_confidence = float(layout_scan.get("confidence") or 0.0)
+    evidence_status = "usable"
+    reasons: list[str] = []
+    if visual_payload.get("layout_unlocated"):
+        evidence_status = "insufficient"
+        reasons.append(visual_payload.get("layout_unlocated_reason") or UNLOCATED_BY_LAYOUT_REASON)
+    elif item.question_type != "objective" and not has_pages:
+        evidence_status = "insufficient"
+        reasons.append("本题没有可用PDF视觉页或裁剪图，不能可靠阅卷。")
+    elif item.question_type in {"blank", "solution"} and layout_scan and not has_focus:
+        evidence_status = "usable_with_warning"
+        reasons.append("本题有整页视觉证据，但缺少可靠单题裁剪；评分需更谨慎。")
+    if layout_scan and b_failed:
+        evidence_status = "insufficient"
+        reasons.append("B轮分组复核在本题上未完成；已依赖A轮定位和单题视觉继续，需关注裁剪范围。")
+    elif layout_scan and not b_verified:
+        if evidence_status == "usable":
+            evidence_status = "usable_with_warning"
+        reasons.append("B轮视觉复核未确认本题定位，已依赖A轮/单题视觉继续。")
+    if item.needs_ocr_review and not has_pages:
+        evidence_status = "insufficient"
+        reasons.append("OCR质量偏低且缺少视觉证据。")
+    if layout_confidence and layout_confidence < 0.45:
+        evidence_status = "insufficient"
+        reasons.append("布局定位置信度过低。")
+    elif layout_confidence and layout_confidence < 0.65 and evidence_status == "usable":
+        evidence_status = "usable_with_warning"
+        reasons.append("布局定位置信度中等，需关注裁剪范围。")
+    return {
+        "status": evidence_status,
+        "must_human_review": evidence_status == "insufficient",
+        "reasons": limit_list(reasons, max_items=5, max_chars=160),
+        "a_round_found": has_layout_pages,
+        "b_round_verified": b_verified,
+        "b_round_failed": b_failed,
+        "single_focus_verified": has_focus,
+        "visual_pages_available": has_pages,
+        "layout_confidence": round(layout_confidence, 3),
+        "ocr_confidence": item.ocr_confidence,
+        "ocr_needs_review": item.needs_ocr_review,
     }
 
 
@@ -1153,7 +1281,7 @@ def stable_layout_entry(question_no: str, entry: dict[str, Any] | None) -> dict[
     if not isinstance(entry, dict):
         return None
     boxes = []
-    for raw_box in ensure_list_of_dicts(entry.get("answer_boxes"))[:3]:
+    for raw_box in ensure_list_of_dicts(entry.get("answer_boxes"))[:LAYOUT_SCAN_MAX_BOXES_PER_QUESTION]:
         box = normalize_ratio_box(raw_box.get("box"))
         if box is None:
             box = normalize_ratio_box([raw_box.get("x1"), raw_box.get("y1"), raw_box.get("x2"), raw_box.get("y2")])
@@ -1165,15 +1293,73 @@ def stable_layout_entry(question_no: str, entry: dict[str, Any] | None) -> dict[
                 "box": [round(value, 4) for value in box],
             }
         )
-    return {
+    stable = {
         "question_no": question_no,
         "page_numbers": normalized_layout_page_numbers(entry),
         "answer_order_index": entry.get("answer_order_index"),
         "confidence": layout_entry_confidence(entry),
         "is_out_of_order": bool(entry.get("is_out_of_order")),
         "answer_boxes": boxes,
+        "recognized_answer_brief": truncate_str(str(entry.get("recognized_answer_brief") or ""), 180),
+        "needs_human_review": bool(entry.get("needs_human_review")),
+        "returned_by_model": bool(entry.get("returned_by_model")),
+        "b_verification_covered": bool(entry.get("b_verification_covered")),
+        "b_verification_failed": bool(entry.get("b_verification_failed")),
+        "layout_verification_degraded": bool(entry.get("layout_verification_degraded")),
         "notes": truncate_str(str(entry.get("notes") or ""), 180),
     }
+    rounds = entry.get("layout_rounds")
+    if isinstance(rounds, dict):
+        stable["layout_rounds"] = {
+            key: value
+            for key, value in rounds.items()
+            if key in {"A", "B"} and isinstance(value, dict)
+        }
+    return stable
+
+
+def stable_answer_layout_for_prompt(layout: AnswerLayout | None, max_items: int = 28) -> dict[str, Any]:
+    if layout is None:
+        return {}
+    rows = []
+    for question_no, entry in sorted(layout.items.items(), key=lambda item: safe_int_or_none(item[0]) or 999):
+        stable = stable_layout_entry(question_no, entry)
+        if stable and (stable.get("page_numbers") or stable.get("answer_boxes") or stable.get("notes")):
+            rows.append(stable)
+    return {
+        "source": layout.source,
+        "global_notes": truncate_str(layout.global_notes, 360),
+        "objective_answer_runs": layout.objective_answer_runs[:6],
+        "items": rows[:max_items],
+    }
+
+
+def mark_layout_verification_degraded(layout: AnswerLayout, errors: list[str], reason: str) -> AnswerLayout:
+    degraded_items: dict[str, dict[str, Any]] = {}
+    for question_no, entry in layout.items.items():
+        row = dict(entry)
+        row["confidence"] = min(layout_entry_confidence(row), 0.72)
+        row["layout_verification_degraded"] = True
+        row["layout_rounds"] = {"A": stable_layout_entry(question_no, entry), "B": None}
+        degraded_items[question_no] = row
+    notes = truncate_str(
+        "；".join(
+            value
+            for value in [
+                layout.global_notes,
+                reason,
+                *errors[-3:],
+            ]
+            if value
+        ),
+        500,
+    )
+    return AnswerLayout(
+        items=degraded_items,
+        global_notes=notes,
+        source="single_xhigh_with_failed_b_verification",
+        objective_answer_runs=layout.objective_answer_runs,
+    )
 
 
 def ensure_list_of_dicts(value: Any) -> list[dict[str, Any]]:
@@ -1228,21 +1414,199 @@ def objective_mapping_from_layout(layout: AnswerLayout | None) -> tuple[dict[str
     return mapping, used_runs
 
 
-def layout_scan_pages(pages: list[VisualPage], max_pages: int = 4) -> list[VisualPage]:
-    if len(pages) <= max_pages:
-        return pages
-    indexes = {0, len(pages) - 1}
-    if len(pages) > 2:
-        indexes.add(1)
-    if len(pages) > 3:
-        indexes.add(len(pages) - 2)
-    return [pages[index] for index in sorted(indexes)[:max_pages]]
+def layout_scan_page_chunks(
+    pages: list[VisualPage],
+    pages_per_chunk: int = LAYOUT_SCAN_PAGES_PER_CHUNK,
+    overlap: int = LAYOUT_SCAN_CHUNK_OVERLAP,
+) -> list[list[VisualPage]]:
+    if not pages:
+        return []
+    chunks: list[list[VisualPage]] = []
+    by_pdf: dict[str, list[VisualPage]] = {}
+    for page in sorted(pages, key=lambda row: (row.source_pdf, row.page_no)):
+        by_pdf.setdefault(page.source_pdf, []).append(page)
+    step = max(1, pages_per_chunk - max(0, min(overlap, pages_per_chunk - 1)))
+    for _, pdf_pages in by_pdf.items():
+        if len(pdf_pages) <= pages_per_chunk:
+            chunks.append(pdf_pages)
+            continue
+        start = 0
+        while start < len(pdf_pages):
+            chunk = pdf_pages[start : start + pages_per_chunk]
+            if chunk:
+                chunks.append(chunk)
+            if start + pages_per_chunk >= len(pdf_pages):
+                break
+            start += step
+    return chunks
 
 
-def visual_payload_for_layout_scan(pages: list[VisualPage], compact: bool = False) -> dict[str, Any]:
+def layout_page_numbers(pages: list[VisualPage]) -> list[int]:
+    return [int(page.page_no) for page in pages]
+
+
+def layout_pdf_page_numbers(pages: list[VisualPage]) -> list[dict[str, Any]]:
+    return [
+        {"source_pdf": Path(pdf).name, "page_numbers": layout_page_numbers(pdf_pages)}
+        for pdf, pdf_pages in sorted(group_visual_pages_by_pdf(pages).items())
+    ]
+
+
+def group_visual_pages_by_pdf(pages: list[VisualPage]) -> dict[str, list[VisualPage]]:
+    grouped: dict[str, list[VisualPage]] = {}
+    for page in sorted(pages, key=lambda row: (row.source_pdf, row.page_no)):
+        grouped.setdefault(page.source_pdf, []).append(page)
+    return grouped
+
+
+def layout_scan_coverage(page_chunks: list[list[VisualPage]]) -> list[dict[str, Any]]:
+    covered: dict[str, set[int]] = {}
+    for chunk in page_chunks:
+        for page in chunk:
+            covered.setdefault(page.source_pdf, set()).add(int(page.page_no))
+    return [
+        {"source_pdf": Path(pdf).name, "page_numbers": sorted(numbers)}
+        for pdf, numbers in sorted(covered.items())
+    ]
+
+
+def missing_layout_pages(all_pages: list[VisualPage], page_chunks: list[list[VisualPage]]) -> list[dict[str, Any]]:
+    expected = {pdf: {int(page.page_no) for page in pdf_pages} for pdf, pdf_pages in group_visual_pages_by_pdf(all_pages).items()}
+    covered = {row["source_pdf"]: set(row["page_numbers"]) for row in layout_scan_coverage(page_chunks)}
+    missing_rows = []
+    for pdf, page_numbers in expected.items():
+        name = Path(pdf).name
+        missing = sorted(page_numbers - covered.get(name, set()))
+        if missing:
+            missing_rows.append({"source_pdf": name, "page_numbers": missing})
+    return missing_rows
+
+
+def format_missing_layout_pages(rows: list[dict[str, Any]]) -> str:
+    return "；".join(f"{row.get('source_pdf')}: {row.get('page_numbers')}" for row in rows)
+
+
+def layout_chunk_cache_key(
+    layout_gateway: ModelGateway,
+    paper_id: str,
+    round_name: str,
+    chunk_index: int,
+    chunk: list[VisualPage],
+    prior_layout: AnswerLayout | None,
+) -> str:
+    payload = {
+        "cache_version": "layout-chunk-v3-page-local-a",
+        "paper_id": paper_id,
+        "round": round_name,
+        "chunk_index": chunk_index,
+        "model": layout_gateway.config.model,
+        "api_mode": layout_gateway.config.api_mode,
+        "reasoning_effort": layout_gateway.config.reasoning_effort,
+        "max_output_tokens": layout_gateway.config.max_output_tokens,
+        "pages": [
+            {
+                "source_pdf_name": Path(page.source_pdf).name,
+                "source_pdf_hash": short_file_hash(Path(page.source_pdf)),
+                "page_no": page.page_no,
+                "image_hash": short_file_hash(Path(page.image_path)),
+            }
+            for page in chunk
+        ],
+        "prior_layout_hash": hashlib.sha1(json.dumps(stable_answer_layout_for_prompt(prior_layout), ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        if prior_layout is not None
+        else "",
+    }
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def short_file_hash(path: Path) -> str:
+    try:
+        hasher = hashlib.sha1()
+        with path.open("rb") as handle:
+            for block in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(block)
+        return hasher.hexdigest()[:16]
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def layout_chunk_cache_path(layout_gateway: ModelGateway, cache_key: str) -> Path:
+    return Path(layout_gateway.config.cache_dir) / "layout_chunks" / f"{cache_key}.json"
+
+
+def read_layout_chunk_cache(layout_gateway: ModelGateway, cache_key: str, call_name: str, audit_log: Path) -> dict[str, Any] | None:
+    if not layout_gateway.config.use_cache:
+        return None
+    path = layout_chunk_cache_path(layout_gateway, cache_key)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw = payload.get("raw_layout")
+        if isinstance(raw, dict):
+            append_jsonl(
+                audit_log,
+                {
+                    "event": "answer_layout_scan_chunk_cache_hit",
+                    "time": utc_now(),
+                    "call_name": call_name,
+                    "cache_key": cache_key,
+                    "cache_path": str(path),
+                },
+            )
+            return raw
+    except Exception as exc:  # noqa: BLE001
+        append_jsonl(
+            audit_log,
+            {
+                "event": "answer_layout_scan_chunk_cache_error",
+                "time": utc_now(),
+                "call_name": call_name,
+                "cache_key": cache_key,
+                "error": f"{type(exc).__name__}: {exc}",
+            },
+        )
+    return None
+
+
+def write_layout_chunk_cache(layout_gateway: ModelGateway, cache_key: str, call_name: str, raw_layout: dict[str, Any], audit_log: Path) -> None:
+    if not layout_gateway.config.use_cache:
+        return
+    path = layout_chunk_cache_path(layout_gateway, cache_key)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "created_at": utc_now(),
+        "cache_key": cache_key,
+        "call_name": call_name,
+        "raw_layout": raw_layout,
+    }
+    tmp_path = path.with_suffix(".tmp")
+    with CACHE_LOCK:
+        tmp_path.write_text(json.dumps(repair_text_encoding(record), ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp_path.replace(path)
+    append_jsonl(
+        audit_log,
+        {
+            "event": "answer_layout_scan_chunk_cache_write",
+            "time": utc_now(),
+            "call_name": call_name,
+            "cache_key": cache_key,
+            "cache_path": str(path),
+        },
+    )
+
+
+def visual_payload_for_layout_scan(
+    pages: list[VisualPage],
+    compact: bool = False,
+    chunk_index: int | None = None,
+    total_chunks: int | None = None,
+    total_page_count: int | None = None,
+) -> dict[str, Any]:
     if not pages:
         return {"enabled": False, "selection_reason": "not_required_or_unavailable", "pages": []}
-    selected_pages = layout_scan_pages(pages, max_pages=3 if compact else 4)
+    selected_pages = sorted(pages, key=lambda page: (page.source_pdf, page.page_no))
     payload_pages = [asdict(page) for page in selected_pages]
     return {
         "enabled": True,
@@ -1255,8 +1619,12 @@ def visual_payload_for_layout_scan(pages: list[VisualPage], compact: bool = Fals
         "attach_pdf_file": False,
         "layout_scan_page_policy": {
             "compact": compact,
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
             "selected_page_count": len(selected_pages),
-            "total_page_count": len(pages),
+            "selected_page_numbers": layout_page_numbers(selected_pages),
+            "total_page_count": total_page_count if total_page_count is not None else len(selected_pages),
+            "full_coverage_required": True,
         },
     }
 
@@ -1497,7 +1865,10 @@ class ModelGateway:
 
     @property
     def endpoint(self) -> str:
-        api_url = self.config.api_url.rstrip("/")
+        return self.endpoint_for_api_url(self.active_api_url)
+
+    def endpoint_for_api_url(self, api_url: str) -> str:
+        api_url = str(api_url or "").rstrip("/")
         if self.config.api_mode == "responses":
             if api_url.endswith("/responses"):
                 return api_url
@@ -1510,13 +1881,32 @@ class ModelGateway:
             return api_url + "/chat/completions"
         return api_url + "/v1/chat/completions"
 
+    @property
+    def api_urls(self) -> list[str]:
+        urls = [part.strip() for part in re.split(r"[;,\n]", self.config.api_url or "") if part.strip()]
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for url in urls or [self.config.api_url]:
+            key = str(url).rstrip("/")
+            if key and key not in seen:
+                seen.add(key)
+                deduped.append(key)
+        return deduped
+
+    @property
+    def active_api_url(self) -> str:
+        return self.api_urls[0]
+
     def cache_key(self, body: dict[str, Any]) -> str:
+        return self.cache_key_for_endpoint(body, self.endpoint)
+
+    def cache_key_for_endpoint(self, body: dict[str, Any], endpoint: str) -> str:
         cache_body = json.loads(json.dumps(body, ensure_ascii=False))
         if isinstance(cache_body, dict):
             cache_body.pop("stream", None)
         payload = {
             "api_mode": self.config.api_mode,
-            "endpoint": self.endpoint,
+            "endpoint": endpoint,
             "model": self.config.model,
             "temperature": self.config.temperature,
             "reasoning_effort": self.config.reasoning_effort,
@@ -1571,6 +1961,7 @@ class ModelGateway:
         max_output_tokens: int | None = None,
         timeout_seconds: int | None = None,
         use_stream: bool | None = None,
+        use_cache: bool | None = None,
     ) -> "ModelGateway":
         return ModelGateway(
             ModelConfig(
@@ -1581,7 +1972,7 @@ class ModelGateway:
                 max_retries=self.config.max_retries,
                 temperature=self.config.temperature,
                 api_mode=self.config.api_mode,
-                use_cache=self.config.use_cache,
+                use_cache=use_cache if use_cache is not None else self.config.use_cache,
                 cache_dir=self.config.cache_dir,
                 max_output_tokens=max_output_tokens if max_output_tokens is not None else self.config.max_output_tokens,
                 reasoning_effort=reasoning_effort if reasoning_effort is not None else self.config.reasoning_effort,
@@ -1596,6 +1987,17 @@ class ModelGateway:
             ),
             self.audit_log,
         )
+
+    def stream_total_timeout_for_call(self, call_name: str) -> int:
+        if not self.config.use_stream:
+            return 0
+        if call_name.startswith("answer_layout_scan_"):
+            return max(30, STREAM_TOTAL_TIMEOUT_LAYOUT_SECONDS)
+        if call_name.endswith("_single_focus_retry") or call_name.endswith("_focus_retry"):
+            return max(30, STREAM_TOTAL_TIMEOUT_FOCUS_SECONDS)
+        if re.match(r"q\d+_single$", call_name or ""):
+            return max(45, STREAM_TOTAL_TIMEOUT_DEFAULT_SECONDS)
+        return max(45, STREAM_TOTAL_TIMEOUT_DEFAULT_SECONDS)
 
     def cache_path(self, cache_key: str) -> Path:
         return Path(self.config.cache_dir) / f"{cache_key}.json"
@@ -1634,7 +2036,15 @@ class ModelGateway:
             )
             return None
 
-    def write_cache(self, cache_key: str, call_name: str, body: dict[str, Any], parsed_json: dict[str, Any], raw_payload: Any) -> None:
+    def write_cache(
+        self,
+        cache_key: str,
+        call_name: str,
+        body: dict[str, Any],
+        parsed_json: dict[str, Any],
+        raw_payload: Any,
+        endpoint: str | None = None,
+    ) -> None:
         if not self.config.use_cache:
             return
         path = self.cache_path(cache_key)
@@ -1642,7 +2052,7 @@ class ModelGateway:
             "created_at": utc_now(),
             "cache_key": cache_key,
             "api_mode": self.config.api_mode,
-            "endpoint": self.endpoint,
+            "endpoint": endpoint or self.endpoint,
             "model": self.config.model,
             "call_name": call_name,
             "request": scrub_request(body),
@@ -1758,86 +2168,189 @@ class ModelGateway:
         last_error: str | None = None
         degradation_limit = max(1, min(len(attempts), max_degradation_attempts or len(attempts)))
         network_retry_limit = max(1, max_network_retries if max_network_retries is not None else self.config.max_retries)
+        endpoints = [(api_url, self.endpoint_for_api_url(api_url)) for api_url in self.api_urls if api_url]
+        if not endpoints:
+            endpoints = [(self.config.api_url, self.endpoint)]
         for degradation_no, body in enumerate(attempts[:degradation_limit], start=1):
             cache_key = self.cache_key(body)
             cached = self.read_cache(cache_key, call_name)
             if cached is not None:
                 return cached
-            for retry_no in range(1, network_retry_limit + 1):
-                started = time.time()
-                append_jsonl(
-                    self.audit_log,
-                    {
-                        "event": "model_call_started",
-                        "time": utc_now(),
-                        "call_name": call_name,
-                        "attempt_no": degradation_no,
-                        "retry_no": retry_no,
-                        "endpoint": self.endpoint,
-                        "model": self.config.model,
-                        "reasoning_effort": self.config.reasoning_effort,
-                        "stream": bool(body.get("stream")),
-                    },
-                )
-                try:
-                    request_started = time.time()
-                    response = requests.post(
-                        self.endpoint,
-                        headers=headers,
-                        json=body,
-                        timeout=self.config.timeout_seconds,
-                        stream=bool(body.get("stream")),
-                    )
-                    header_elapsed = round(time.time() - request_started, 3)
-                    payload = safe_response_payload(response, stream=bool(body.get("stream")))
-                    elapsed = round(time.time() - started, 3)
+            for endpoint_no, (api_url, endpoint) in enumerate(endpoints, start=1):
+                circuit_reason = endpoint_circuit_block_reason(endpoint)
+                if circuit_reason:
+                    last_error = circuit_reason
                     append_jsonl(
                         self.audit_log,
                         {
-                            "event": "model_call",
+                            "event": "model_endpoint_circuit_open",
+                            "time": utc_now(),
+                            "call_name": call_name,
+                            "attempt_no": degradation_no,
+                            "endpoint_no": endpoint_no,
+                            "endpoint": endpoint,
+                            "error": circuit_reason,
+                        },
+                    )
+                    if endpoint_no < len(endpoints):
+                        continue
+                    raise RuntimeError(circuit_reason)
+                endpoint_cache_key = self.cache_key_for_endpoint(body, endpoint)
+                if endpoint_cache_key != cache_key:
+                    cached = self.read_cache(endpoint_cache_key, call_name)
+                    if cached is not None:
+                        return cached
+                for retry_no in range(1, network_retry_limit + 1):
+                    started = time.time()
+                    append_jsonl(
+                        self.audit_log,
+                        {
+                            "event": "model_call_started",
                             "time": utc_now(),
                             "call_name": call_name,
                             "attempt_no": degradation_no,
                             "retry_no": retry_no,
-                            "endpoint": self.endpoint,
+                            "endpoint_no": endpoint_no,
+                            "endpoint": endpoint,
                             "model": self.config.model,
-                            "status_code": response.status_code,
-                            "elapsed_seconds": elapsed,
-                            "header_elapsed_seconds": header_elapsed,
-                            "usage": extract_usage_summary(payload),
-                            "request": scrub_request(body),
-                            "response_preview": compact_text(json.dumps(payload, ensure_ascii=False), limit=6000),
+                            "reasoning_effort": self.config.reasoning_effort,
                             "stream": bool(body.get("stream")),
                         },
                     )
-                    if response.status_code >= 400:
-                        last_error = f"HTTP {response.status_code}: {payload}"
-                        if is_retryable_status(response.status_code) and retry_no < network_retry_limit:
+                    try:
+                        request_started = time.time()
+                        response = requests.post(
+                            endpoint,
+                            headers=headers,
+                            json=body,
+                            timeout=self.stream_total_timeout_for_call(call_name) or self.config.timeout_seconds,
+                            stream=bool(body.get("stream")),
+                        )
+                        header_elapsed = round(time.time() - request_started, 3)
+                        payload = safe_response_payload(
+                            response,
+                            stream=bool(body.get("stream")),
+                            total_timeout_seconds=self.stream_total_timeout_for_call(call_name),
+                        )
+                        elapsed = round(time.time() - started, 3)
+                        append_jsonl(
+                            self.audit_log,
+                            {
+                                "event": "model_call",
+                                "time": utc_now(),
+                                "call_name": call_name,
+                                "attempt_no": degradation_no,
+                                "retry_no": retry_no,
+                                "endpoint_no": endpoint_no,
+                                "endpoint": endpoint,
+                                "model": self.config.model,
+                                "status_code": response.status_code,
+                                "elapsed_seconds": elapsed,
+                                "header_elapsed_seconds": header_elapsed,
+                                "usage": extract_usage_summary(payload),
+                                "request": scrub_request(body),
+                                "response_preview": compact_text(json.dumps(payload, ensure_ascii=False), limit=6000),
+                                "stream": bool(body.get("stream")),
+                            },
+                        )
+                        if response.status_code >= 400:
+                            last_error = f"HTTP {response.status_code}: {payload}"
+                            if is_retryable_status(response.status_code) and record_endpoint_failure(endpoint, last_error):
+                                append_jsonl(
+                                    self.audit_log,
+                                    {
+                                        "event": "model_endpoint_circuit_tripped",
+                                        "time": utc_now(),
+                                        "call_name": call_name,
+                                        "attempt_no": degradation_no,
+                                        "retry_no": retry_no,
+                                        "endpoint_no": endpoint_no,
+                                        "endpoint": endpoint,
+                                        "error": last_error,
+                                    },
+                                )
+                            if is_retryable_status(response.status_code) and retry_no < network_retry_limit:
+                                sleep_for_retry(retry_no, degradation_no)
+                                continue
+                            break
+                        content = extract_message_content(payload, self.config.api_mode)
+                        parsed_json = parse_json_object(content)
+                        record_endpoint_success(endpoint)
+                        self.write_cache(endpoint_cache_key, call_name, body, parsed_json, payload, endpoint=endpoint)
+                        return parsed_json
+                    except Exception as exc:  # noqa: BLE001
+                        last_error = f"{type(exc).__name__}: {exc}"
+                        if isinstance(exc, StreamingResponseInterrupted):
+                            partial_payload = safe_partial_stream_payload(exc.partial_text)
+                            if partial_payload is not None:
+                                with contextlib.suppress(Exception):
+                                    content = extract_message_content(partial_payload, self.config.api_mode)
+                                    parsed_json = parse_json_object(content)
+                                    self.write_cache(endpoint_cache_key, call_name, body, parsed_json, partial_payload, endpoint=endpoint)
+                                    append_jsonl(
+                                        self.audit_log,
+                                        {
+                                            "event": "model_call_partial_stream_recovered",
+                                            "time": utc_now(),
+                                            "call_name": call_name,
+                                            "attempt_no": degradation_no,
+                                            "retry_no": retry_no,
+                                            "endpoint_no": endpoint_no,
+                                            "endpoint": endpoint,
+                                            "model": self.config.model,
+                                            "error": last_error,
+                                            "partial_chars": len(exc.partial_text),
+                                            "usage": extract_usage_summary(partial_payload),
+                                            "stream": bool(body.get("stream")),
+                                        },
+                                    )
+                                    record_endpoint_success(endpoint)
+                                    return parsed_json
+                        if is_retryable_exception(exc) and record_endpoint_failure(endpoint, last_error):
+                            append_jsonl(
+                                self.audit_log,
+                                {
+                                    "event": "model_endpoint_circuit_tripped",
+                                    "time": utc_now(),
+                                    "call_name": call_name,
+                                    "attempt_no": degradation_no,
+                                    "retry_no": retry_no,
+                                    "endpoint_no": endpoint_no,
+                                    "endpoint": endpoint,
+                                    "error": last_error,
+                                },
+                            )
+                        append_jsonl(
+                            self.audit_log,
+                            {
+                                "event": "model_call_error",
+                                "time": utc_now(),
+                                "call_name": call_name,
+                                "attempt_no": degradation_no,
+                                "retry_no": retry_no,
+                                "endpoint_no": endpoint_no,
+                                "endpoint": endpoint,
+                                "error": last_error,
+                                "stream": bool(body.get("stream")),
+                            },
+                        )
+                        if retry_no < network_retry_limit:
                             sleep_for_retry(retry_no, degradation_no)
                             continue
                         break
-                    content = extract_message_content(payload, self.config.api_mode)
-                    parsed_json = parse_json_object(content)
-                    self.write_cache(cache_key, call_name, body, parsed_json, payload)
-                    return parsed_json
-                except Exception as exc:  # noqa: BLE001
-                    last_error = f"{type(exc).__name__}: {exc}"
+                if endpoint_no < len(endpoints):
                     append_jsonl(
                         self.audit_log,
                         {
-                            "event": "model_call_error",
+                            "event": "model_endpoint_failover",
                             "time": utc_now(),
                             "call_name": call_name,
                             "attempt_no": degradation_no,
-                            "retry_no": retry_no,
+                            "failed_endpoint_no": endpoint_no,
+                            "next_endpoint_no": endpoint_no + 1,
                             "error": last_error,
-                            "stream": bool(body.get("stream")),
                         },
                     )
-                    if retry_no < network_retry_limit:
-                        sleep_for_retry(retry_no, degradation_no)
-                        continue
-                    break
             sleep_for_retry(1, degradation_no, cap=4.0)
         raise RuntimeError(last_error or "model call failed")
 
@@ -1867,10 +2380,10 @@ def extract_usage_summary(payload: Any) -> dict[str, Any]:
     return summary
 
 
-def safe_response_payload(response: requests.Response, stream: bool = False) -> Any:
+def safe_response_payload(response: requests.Response, stream: bool = False, total_timeout_seconds: int = 0) -> Any:
     if not stream:
         return safe_response_json(response)
-    text = read_streaming_response_text(response)
+    text = read_streaming_response_text(response, total_timeout_seconds=total_timeout_seconds)
     if response.status_code >= 400:
         with contextlib.suppress(json.JSONDecodeError):
             return json.loads(text)
@@ -1883,19 +2396,54 @@ def safe_response_payload(response: requests.Response, stream: bool = False) -> 
     return {"output_text": text}
 
 
-def read_streaming_response_text(response: requests.Response) -> str:
+def read_streaming_response_text(response: requests.Response, total_timeout_seconds: int = 0) -> str:
     chunks: list[str] = []
+    started = time.monotonic()
     try:
-        for line in response.iter_lines(decode_unicode=False):
-            if line is None:
-                continue
-            if isinstance(line, bytes):
-                chunks.append(line.decode("utf-8", errors="replace"))
-            else:
-                chunks.append(str(line))
+        try:
+            for line in response.iter_lines(decode_unicode=False):
+                if line is None:
+                    continue
+                if isinstance(line, bytes):
+                    chunks.append(line.decode("utf-8", errors="replace"))
+                else:
+                    chunks.append(str(line))
+                if total_timeout_seconds > 0 and time.monotonic() - started > total_timeout_seconds:
+                    partial_text = "\n".join(chunks)
+                    raise StreamingResponseInterrupted(
+                        f"stream total timeout after {total_timeout_seconds}s",
+                        partial_text,
+                    )
+        except requests.exceptions.ChunkedEncodingError as exc:
+            partial_text = "\n".join(chunks)
+            raise StreamingResponseInterrupted(f"{type(exc).__name__}: {exc}", partial_text) from exc
+        except requests.exceptions.ConnectionError as exc:
+            partial_text = "\n".join(chunks)
+            if partial_text:
+                raise StreamingResponseInterrupted(f"{type(exc).__name__}: {exc}", partial_text) from exc
+            raise
     finally:
         response.close()
     return "\n".join(chunks)
+
+
+def safe_partial_stream_payload(text: str) -> dict[str, Any] | None:
+    if not text.strip():
+        return None
+    parsed = parse_streaming_response_payload(text)
+    if parsed is None:
+        return None
+    with contextlib.suppress(Exception):
+        content = extract_message_content(parsed, "responses")
+        parse_json_object(content)
+        parsed["partial_stream_recovered"] = True
+        return parsed
+    with contextlib.suppress(Exception):
+        content = extract_message_content(parsed, "chat")
+        parse_json_object(content)
+        parsed["partial_stream_recovered"] = True
+        return parsed
+    return None
 
 
 def parse_streaming_response_payload(text: str) -> dict[str, Any] | None:
@@ -1968,6 +2516,18 @@ def parse_streaming_response_payload(text: str) -> dict[str, Any] | None:
 
 def is_retryable_status(status_code: int) -> bool:
     return status_code in {408, 409, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+
+
+def is_retryable_exception(exc: Exception) -> bool:
+    return isinstance(
+        exc,
+        (
+            requests.exceptions.Timeout,
+            requests.exceptions.ConnectionError,
+            requests.exceptions.ChunkedEncodingError,
+            StreamingResponseInterrupted,
+        ),
+    )
 
 
 def sleep_for_retry(retry_no: int, degradation_no: int, cap: float = 12.0) -> None:
@@ -2139,13 +2699,27 @@ def parse_json_object(text: str) -> dict[str, Any]:
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
-        match = re.search(r"\{.*\}", text, flags=re.S)
-        if not match:
-            raise
-        payload = json.loads(match.group(0))
+        payload = parse_first_json_object(text)
     if not isinstance(payload, dict):
         raise ValueError("model JSON output must be an object")
     return payload
+
+
+def parse_first_json_object(text: str) -> Any:
+    decoder = json.JSONDecoder()
+    starts = [match.start() for match in re.finditer(r"\{", text)]
+    last_error: json.JSONDecodeError | None = None
+    for start in starts:
+        try:
+            payload, _ = decoder.raw_decode(text[start:])
+            if isinstance(payload, dict):
+                return payload
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            continue
+    if last_error is not None:
+        raise last_error
+    raise json.JSONDecodeError("No JSON object found", text, 0)
 
 
 def shrink_reference(reference: dict[str, Any], limit: int) -> dict[str, Any]:
@@ -2504,7 +3078,11 @@ def build_answer_layout_scan_messages(
     paper_id: str,
     scan_round: str = "A",
     compact: bool = False,
+    prior_layout: AnswerLayout | None = None,
+    verification_group: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
+    is_verification_round = prior_layout is not None
+    target_question_nos = {str(value) for value in (verification_group or {}).get("question_nos", [])}
     system = (
         PROMPT_CACHE_PRIMER
         + "\n\n"
@@ -2512,6 +3090,11 @@ def build_answer_layout_scan_messages(
         "只从整份学生答卷 PDF 页图中找出每道题的学生作答位置、作答顺序和大致裁剪框。"
         "考生可能不按题号顺序作答，例如先写18再写17；你必须按卷面真实位置记录。"
         "输出必须是合法 JSON。"
+        + (
+            "本轮是B轮分组复核，只复核指定题号；只输出指定题号中与A轮不同或需要补漏的题；没有差异时输出空items和global_notes即可，禁止重复抄写A轮全部结果。"
+            if is_verification_round
+            else ""
+        )
     )
     questions = []
     for item in items:
@@ -2519,14 +3102,33 @@ def build_answer_layout_scan_messages(
             "question_no": item.question_no,
             "question_type": item.question_type,
         }
+        if target_question_nos and item.question_no not in target_question_nos:
+            continue
         if not compact:
             row["mineru_answer_hint"] = compact_text(item.text, limit=160)
         questions.append(row)
     user_payload = {
         "task": "scan_student_answer_layout_before_grading",
         "scan_round": scan_round,
-        "scan_mode": "compact" if compact else "full",
+        "scan_mode": "verification_delta" if is_verification_round else "compact" if compact else "full",
         "paper_id": paper_id,
+        "verification_group": verification_group or {},
+        "page_coverage_contract": {
+            "mode": "chunked_full_coverage",
+            "chunk_index": (visual_payload.get("layout_scan_page_policy") or {}).get("chunk_index"),
+            "total_chunks": (visual_payload.get("layout_scan_page_policy") or {}).get("total_chunks"),
+            "selected_page_numbers": (visual_payload.get("layout_scan_page_policy") or {}).get("selected_page_numbers"),
+            "instruction": "本次只处理所附页图；必须逐页检查本 chunk 的每一页。不要声称看过未附上的页面。",
+        },
+        "verification_context": (
+            {
+                "mode": "verify_prior_round_layout",
+                "instruction": "这是A轮在同一页块上的定位结果。B轮必须重新看卷面逐页复核；只处理verification_group.question_nos里的题；只返回错位、漏题、答案串不同、跨页未合并、选择题答案串不同或需要人工复核的题。若A轮基本正确，返回空items；但即使items为空，也必须在global_notes里用一句话说明本组已逐页复核且未发现差异。",
+                "prior_layout": stable_answer_layout_for_prompt(prior_layout),
+            }
+            if prior_layout is not None
+            else {"mode": "primary_scan", "instruction": "这是A轮主扫描；必须独立逐页定位，不依赖OCR猜测。"}
+        ),
         "questions": questions,
         "student_answer_visual_evidence": {
             **{key: value for key, value in visual_payload.items() if key not in {"pages", "focus_pages"}},
@@ -2538,12 +3140,14 @@ def build_answer_layout_scan_messages(
             "必须特别处理 1-16 小题：先判断学生是集中写答案串，还是写在每道题题旁/横线附近。",
             "选择题若出现类似“1~5: DBACB, 6~10: ACACB”的集中答案串，必须写入 objective_answer_runs。",
             "填空题只在明确看到题号或相邻题号时定位；看不到题号上下文就不要给框。",
-            "每题先找题号或学生写出的题号，再框出该题主要作答区域；跨页续写时最多给两个框。",
+            "每题先找题号或学生写出的题号，再框出本页主要作答区域；若同一题跨多页，当前页只返回当前页可见作答框，后续合并时会保留多页框。",
             "answer_boxes 使用相对坐标 [x1,y1,x2,y2]，范围 0-1，覆盖学生作答，不要只框题号。",
             "对小题，answer_boxes 必须带题号或相邻题号上下文，避免把相邻题作答框进去。",
             "若题号顺序与卷面顺序不同，is_out_of_order=true，并在 notes 说明。",
             "看不清或不能确定位置时仍返回该题，但 page_numbers=[]、confidence 低、needs_human_review=true。",
             "不要把题目 PDF 或参考答案当成学生作答；这里只看学生答卷。",
+            "若本轮是B轮复核，必须先看A轮定位摘要，再重新看本页块图像纠错；只输出指定题号的差异和补漏，不得直接照抄A轮。",
+            "若本轮是B轮复核且没有差异，items 可以为空，但这代表你已经逐页看过本组，不是跳过任务；global_notes 必须说明已覆盖的题号。",
         ],
         "required_output_schema": {
             "objective_answer_runs": [
@@ -2573,10 +3177,11 @@ def build_answer_layout_scan_messages(
             "global_notes": "string",
         },
         "output_constraints": {
-            "max_boxes_per_question": 1 if compact else 2,
-            "max_notes_chars": 60 if compact else 90,
+            "max_boxes_per_question": 1 if compact else LAYOUT_SCAN_MAX_BOXES_PER_QUESTION,
+            "max_notes_chars": 50 if is_verification_round else 60 if compact else 90,
             "coordinate_precision": 3,
             "compact_output": compact,
+            "verification_delta_only": is_verification_round,
         },
     }
     user_parts: list[dict[str, Any]] = []
@@ -2597,8 +3202,25 @@ def scan_answer_layout(
 ) -> AnswerLayout | None:
     if not visual_pages or not items:
         return None
-    visual_payload = visual_payload_for_layout_scan(visual_pages)
-    layout_gateway = gateway.with_overrides(reasoning_effort="xhigh", max_output_tokens=LAYOUT_SCAN_MAX_OUTPUT_TOKENS, use_stream=True)
+    page_chunks = layout_scan_page_chunks(visual_pages)
+    missing_pages = missing_layout_pages(visual_pages, page_chunks)
+    if missing_pages:
+        append_jsonl(
+            audit_log,
+            {
+                "event": "answer_layout_scan_coverage_failed",
+                "time": utc_now(),
+                "missing_pages": missing_pages,
+                "chunk_page_numbers": [layout_page_numbers(chunk) for chunk in page_chunks],
+            },
+        )
+        return None
+    layout_gateway = gateway.with_overrides(
+        reasoning_effort="xhigh",
+        max_output_tokens=LAYOUT_SCAN_MAX_OUTPUT_TOKENS,
+        timeout_seconds=STREAM_TOTAL_TIMEOUT_LAYOUT_SECONDS,
+        use_stream=True,
+    )
     append_jsonl(
         audit_log,
         {
@@ -2608,71 +3230,99 @@ def scan_answer_layout(
             "page_count": len(visual_pages),
             "reasoning_effort": layout_gateway.config.reasoning_effort,
             "max_output_tokens": layout_gateway.config.max_output_tokens,
-            "layout_payload_pages": len(visual_payload.get("pages") or []),
+            "a_round_parallel_chunks": min(LAYOUT_SCAN_A_PARALLEL_CHUNKS, len(page_chunks)),
+            "a_round_scan_mode": "page_local_parallel_index",
+            "layout_chunk_count": len(page_chunks),
+            "pages_per_chunk": LAYOUT_SCAN_PAGES_PER_CHUNK,
+            "chunk_overlap": LAYOUT_SCAN_CHUNK_OVERLAP,
+            "full_page_coverage_required": True,
+            "chunk_page_numbers": [layout_page_numbers(chunk) for chunk in page_chunks],
+            "expected_page_numbers": layout_pdf_page_numbers(visual_pages),
+            "covered_page_numbers": layout_scan_coverage(page_chunks),
         },
     )
     errors: list[str] = []
+    chunk_results: dict[str, dict[int, AnswerLayout]] = {"A": {}, "B": {}}
     try:
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            futures = {
-                executor.submit(
-                    layout_gateway.call_json,
-                    build_answer_layout_scan_messages(items, visual_payload, paper_id, scan_round="A"),
-                    "answer_layout_scan_A",
-                    max_network_retries=1,
-                    max_degradation_attempts=1,
-                ): "A",
-                executor.submit(
-                    layout_gateway.call_json,
-                    build_answer_layout_scan_messages(items, visual_payload, paper_id, scan_round="B"),
-                    "answer_layout_scan_B",
-                    max_network_retries=1,
-                    max_degradation_attempts=1,
-                ): "B",
-            }
-            layouts: dict[str, AnswerLayout] = {}
-            for future in as_completed(futures):
-                round_name = futures[future]
-                try:
-                    layouts[round_name] = normalize_answer_layout(
-                        future.result(),
-                        items,
-                        source=f"model_whole_submission_visual_scan_{round_name}",
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    error = f"{round_name}: {type(exc).__name__}: {exc}"
-                    errors.append(error)
-                    append_jsonl(
-                        audit_log,
-                        {
-                            "event": "answer_layout_scan_round_failed",
-                            "time": utc_now(),
-                            "round": round_name,
-                            "error": error,
-                        },
-                    )
-            if "A" in layouts and "B" in layouts:
-                layout = merge_answer_layouts(layouts["A"], layouts["B"], items)
-            elif layouts:
-                round_name, layout = next(iter(layouts.items()))
-                layout.source = f"single_xhigh_visual_scan_{round_name}_fallback"
-                layout.global_notes = truncate_str(
-                    "；".join(
-                        value
-                        for value in [
-                            layout.global_notes,
-                            "双xhigh视觉定位仅一路成功，后续单题视觉与 MinerU 需加强复核。",
-                            *errors,
-                        ]
-                        if value
-                    ),
-                    500,
+        layouts: dict[str, AnswerLayout] = {}
+        try:
+            layouts["A"], chunk_results["A"] = scan_answer_layout_round(
+                layout_gateway,
+                items,
+                page_chunks,
+                paper_id,
+                "A",
+                audit_log,
+                prior_layout=None,
+                compact=True,
+                max_parallel_chunks=LAYOUT_SCAN_A_PARALLEL_CHUNKS,
+                max_network_retries=1,
+                max_degradation_attempts=1,
+            )
+        except Exception as exc:  # noqa: BLE001
+            error = f"A: {type(exc).__name__}: {exc}"
+            errors.append(error)
+            append_jsonl(
+                audit_log,
+                {
+                    "event": "answer_layout_scan_round_failed",
+                    "time": utc_now(),
+                    "round": "A",
+                    "error": error,
+                },
+            )
+        if "A" in layouts:
+            try:
+                verification_gateway = layout_gateway.with_overrides(
+                    max_output_tokens=LAYOUT_SCAN_COMPACT_MAX_OUTPUT_TOKENS,
+                    timeout_seconds=STREAM_TOTAL_TIMEOUT_LAYOUT_SECONDS,
                 )
-            else:
-                compact_layout = scan_answer_layout_compact_fallback(gateway, items, visual_pages, paper_id, audit_log, errors)
-                if compact_layout is not None:
-                    return compact_layout
-                raise RuntimeError("；".join(errors) or "dual xhigh visual scan failed")
+                layouts["B"], chunk_results["B"] = scan_answer_layout_b_groups(
+                    verification_gateway,
+                    items,
+                    visual_pages,
+                    paper_id,
+                    audit_log,
+                    layouts["A"],
+                    max_groups=LAYOUT_SCAN_B_PARALLEL_GROUPS,
+                )
+            except Exception as exc:  # noqa: BLE001
+                error = f"B: {type(exc).__name__}: {exc}"
+                errors.append(error)
+                append_jsonl(
+                    audit_log,
+                    {
+                        "event": "answer_layout_scan_round_failed",
+                        "time": utc_now(),
+                        "round": "B",
+                        "error": error,
+                    },
+                )
+        if "A" in layouts and "B" in layouts:
+            layout = merge_answer_layouts(layouts["A"], layouts["B"], items)
+        elif "A" in layouts:
+            layout = mark_layout_verification_degraded(
+                layouts["A"],
+                errors,
+                "B轮xhigh复核断流或失败；采用A轮完整全页定位继续阅卷，后续每题仍会使用局部视觉复核。",
+            )
+            append_jsonl(
+                audit_log,
+                {
+                    "event": "answer_layout_scan_b_round_degraded_to_a",
+                    "time": utc_now(),
+                    "reason": "B round failed; using complete A round layout",
+                    "round_errors": errors,
+                    "located_question_count": sum(1 for entry in layout.items.values() if normalized_layout_page_numbers(entry)),
+                    "objective_answer_run_count": len(layout.objective_answer_runs),
+                },
+            )
+        else:
+            compact_layout = scan_answer_layout_compact_fallback(gateway, items, visual_pages, paper_id, audit_log, errors)
+            if compact_layout is not None:
+                return compact_layout
+            missing_rounds = sorted({"A"} - set(layouts))
+            raise RuntimeError("双xhigh必须A/B两轮完整覆盖；缺失轮次 " + ",".join(missing_rounds) + ("；" + "；".join(errors) if errors else ""))
         append_jsonl(
             audit_log,
             {
@@ -2688,6 +3338,13 @@ def scan_answer_layout(
                 "global_notes": layout.global_notes,
                 "source": layout.source,
                 "round_errors": errors,
+                "layout_chunk_count": len(page_chunks),
+                "scanned_page_numbers": layout_page_numbers(visual_pages),
+                "expected_page_numbers": layout_pdf_page_numbers(visual_pages),
+                "covered_page_numbers": layout_scan_coverage(page_chunks),
+                "scan_coverage_ratio": 1.0,
+                "round_chunk_counts": {round_name: len(per_chunk) for round_name, per_chunk in chunk_results.items()},
+                "ab_full_coverage_required": True,
             },
         )
         return layout
@@ -2703,6 +3360,825 @@ def scan_answer_layout(
         return None
 
 
+def scan_answer_layout_round(
+    layout_gateway: ModelGateway,
+    items: list[AnswerItem],
+    page_chunks: list[list[VisualPage]],
+    paper_id: str,
+    round_name: str,
+    audit_log: Path,
+    prior_layout: AnswerLayout | None = None,
+    compact: bool = False,
+    max_parallel_chunks: int = 1,
+    max_network_retries: int | None = None,
+    max_degradation_attempts: int | None = None,
+) -> tuple[AnswerLayout, dict[int, AnswerLayout]]:
+    per_chunk: dict[int, AnswerLayout] = {}
+    chunk_errors: list[str] = []
+    total_pages = len({(page.source_pdf, page.page_no) for chunk in page_chunks for page in chunk})
+    total_chunks = len(page_chunks)
+
+    def run_chunk(idx: int, chunk: list[VisualPage]) -> tuple[int, AnswerLayout]:
+        visual_payload = visual_payload_for_layout_scan(
+            chunk,
+            compact=compact,
+            chunk_index=idx,
+            total_chunks=total_chunks,
+            total_page_count=total_pages,
+        )
+        append_jsonl(
+            audit_log,
+            {
+                "event": "answer_layout_scan_chunk_started",
+                "time": utc_now(),
+                "round": round_name,
+                "chunk_index": idx,
+                "total_chunks": total_chunks,
+                "page_numbers": layout_page_numbers(chunk),
+                "reasoning_effort": layout_gateway.config.reasoning_effort,
+                "compact": compact,
+            },
+        )
+        chunk_prior_layout = layout_for_chunk(prior_layout, chunk, items) if prior_layout is not None else None
+        call_name = f"answer_layout_scan_{round_name}_chunk{idx}"
+        cache_key = layout_chunk_cache_key(layout_gateway, paper_id, round_name, idx, chunk, chunk_prior_layout)
+        raw = read_layout_chunk_cache(layout_gateway, cache_key, call_name, audit_log)
+        if raw is None:
+            raw = layout_gateway.call_json(
+                build_answer_layout_scan_messages(
+                    items,
+                    visual_payload,
+                    paper_id,
+                    scan_round=f"{round_name}-chunk-{idx}",
+                    compact=compact,
+                    prior_layout=chunk_prior_layout,
+                ),
+                call_name,
+                max_network_retries=max_network_retries if max_network_retries is not None else layout_gateway.config.max_retries,
+                max_degradation_attempts=max_degradation_attempts if max_degradation_attempts is not None else 2,
+            )
+            write_layout_chunk_cache(layout_gateway, cache_key, call_name, raw, audit_log)
+        layout = normalize_answer_layout(raw, items, source=f"model_chunked_visual_scan_{round_name}_{idx}")
+        append_jsonl(
+            audit_log,
+            {
+                "event": "answer_layout_scan_chunk_finished",
+                "time": utc_now(),
+                "round": round_name,
+                "chunk_index": idx,
+                "total_chunks": total_chunks,
+                "page_numbers": layout_page_numbers(chunk),
+                "located_question_count": sum(1 for entry in layout.items.values() if normalized_layout_page_numbers(entry)),
+                "objective_answer_run_count": len(layout.objective_answer_runs),
+            },
+        )
+        return idx, layout
+
+    max_workers = max(1, min(max_parallel_chunks, len(page_chunks)))
+    if max_workers == 1:
+        for idx, chunk in enumerate(page_chunks, start=1):
+            try:
+                chunk_idx, layout = run_chunk(idx, chunk)
+                per_chunk[chunk_idx] = layout
+            except Exception as exc:  # noqa: BLE001
+                error = f"chunk {idx} pages {layout_page_numbers(chunk)}: {type(exc).__name__}: {exc}"
+                chunk_errors.append(error)
+                append_jsonl(
+                    audit_log,
+                    {
+                        "event": "answer_layout_scan_chunk_failed",
+                        "time": utc_now(),
+                        "round": round_name,
+                        "chunk_index": idx,
+                        "total_chunks": len(page_chunks),
+                        "page_numbers": layout_page_numbers(chunk),
+                        "error": error,
+                    },
+                )
+    else:
+        append_jsonl(
+            audit_log,
+            {
+                "event": "answer_layout_scan_chunk_dispatch_started",
+                "time": utc_now(),
+                "round": round_name,
+                "total_chunks": total_chunks,
+                "parallelism": max_workers,
+                "compact": compact,
+            },
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {executor.submit(run_chunk, idx, chunk): (idx, chunk) for idx, chunk in enumerate(page_chunks, start=1)}
+            for future in as_completed(future_map):
+                idx, chunk = future_map[future]
+                try:
+                    chunk_idx, layout = future.result()
+                    per_chunk[chunk_idx] = layout
+                except Exception as exc:  # noqa: BLE001
+                    error = f"chunk {idx} pages {layout_page_numbers(chunk)}: {type(exc).__name__}: {exc}"
+                    chunk_errors.append(error)
+                    append_jsonl(
+                        audit_log,
+                        {
+                            "event": "answer_layout_scan_chunk_failed",
+                            "time": utc_now(),
+                            "round": round_name,
+                            "chunk_index": idx,
+                            "total_chunks": len(page_chunks),
+                            "page_numbers": layout_page_numbers(chunk),
+                            "error": error,
+                        },
+                    )
+
+    if len(per_chunk) != len(page_chunks):
+        missing = [(idx, chunk) for idx, chunk in enumerate(page_chunks, start=1) if idx not in per_chunk]
+        retry_gateway = layout_gateway.with_overrides(
+            reasoning_effort="high",
+            max_output_tokens=LAYOUT_SCAN_COMPACT_MAX_OUTPUT_TOKENS,
+            timeout_seconds=STREAM_TOTAL_TIMEOUT_LAYOUT_SECONDS,
+            use_stream=True,
+        )
+        append_jsonl(
+            audit_log,
+            {
+                "event": "answer_layout_scan_missing_chunks_retry_started",
+                "time": utc_now(),
+                "round": round_name,
+                "missing_chunks": [
+                    {"chunk_index": idx, "page_numbers": layout_page_numbers(chunk)}
+                    for idx, chunk in missing
+                ],
+                "reasoning_effort": retry_gateway.config.reasoning_effort,
+            },
+        )
+        retry_workers = max(1, min(LAYOUT_SCAN_A_PARALLEL_CHUNKS, len(missing)))
+        with ThreadPoolExecutor(max_workers=retry_workers) as executor:
+            future_map = {
+                executor.submit(
+                    scan_answer_layout_retry_chunk,
+                    retry_gateway,
+                    items,
+                    chunk,
+                    total_chunks,
+                    total_pages,
+                    paper_id,
+                    round_name,
+                    idx,
+                    audit_log,
+                    prior_layout,
+                ): (idx, chunk)
+                for idx, chunk in missing
+            }
+            for future in as_completed(future_map):
+                idx, chunk = future_map[future]
+                try:
+                    chunk_idx, layout = future.result()
+                    per_chunk[chunk_idx] = layout
+                except Exception as exc:  # noqa: BLE001
+                    error = f"chunk {idx} pages {layout_page_numbers(chunk)}: {type(exc).__name__}: {exc}"
+                    chunk_errors.append(error)
+                    append_jsonl(
+                        audit_log,
+                        {
+                            "event": "answer_layout_scan_missing_chunk_retry_failed",
+                            "time": utc_now(),
+                            "round": round_name,
+                            "chunk_index": idx,
+                            "total_chunks": total_chunks,
+                            "page_numbers": layout_page_numbers(chunk),
+                            "error": error,
+                        },
+                    )
+    if len(per_chunk) != len(page_chunks):
+        missing_chunks = [idx for idx in range(1, len(page_chunks) + 1) if idx not in per_chunk]
+        if not per_chunk:
+            raise RuntimeError(
+                f"{round_name}轮xhigh未完整覆盖全部页面块；缺失块 {missing_chunks}；"
+                + ("；".join(chunk_errors) or f"round {round_name} produced incomplete chunk layout")
+            )
+        append_jsonl(
+            audit_log,
+            {
+                "event": "answer_layout_scan_partial_layout_salvaged",
+                "time": utc_now(),
+                "round": round_name,
+                "completed_chunks": sorted(per_chunk),
+                "missing_chunks": missing_chunks,
+                "errors": chunk_errors[-6:],
+            },
+        )
+    layout = merge_layout_chunks(per_chunk, items, source=f"chunked_xhigh_visual_scan_{round_name}")
+    if chunk_errors:
+        layout.global_notes = truncate_str(
+            "；".join([layout.global_notes, f"{round_name}轮部分页面块失败", *chunk_errors]).strip("；"),
+            500,
+        )
+    return layout, per_chunk
+
+
+def scan_answer_layout_retry_chunk(
+    layout_gateway: ModelGateway,
+    items: list[AnswerItem],
+    chunk: list[VisualPage],
+    total_chunks: int,
+    total_pages: int,
+    paper_id: str,
+    round_name: str,
+    chunk_index: int,
+    audit_log: Path,
+    prior_layout: AnswerLayout | None = None,
+) -> tuple[int, AnswerLayout]:
+    visual_payload = visual_payload_for_layout_scan(
+        chunk,
+        compact=True,
+        chunk_index=chunk_index,
+        total_chunks=total_chunks,
+        total_page_count=total_pages,
+    )
+    append_jsonl(
+        audit_log,
+        {
+            "event": "answer_layout_scan_retry_chunk_started",
+            "time": utc_now(),
+            "round": round_name,
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
+            "page_numbers": layout_page_numbers(chunk),
+            "reasoning_effort": layout_gateway.config.reasoning_effort,
+        },
+    )
+    chunk_prior_layout = layout_for_chunk(prior_layout, chunk, items) if prior_layout is not None else None
+    call_name = f"answer_layout_scan_{round_name}_chunk{chunk_index}_retry_high"
+    cache_key = layout_chunk_cache_key(layout_gateway, paper_id, f"{round_name}-retry-high", chunk_index, chunk, chunk_prior_layout)
+    raw = read_layout_chunk_cache(layout_gateway, cache_key, call_name, audit_log)
+    if raw is None:
+        raw = layout_gateway.call_json(
+            build_answer_layout_scan_messages(
+                items,
+                visual_payload,
+                paper_id,
+                scan_round=f"{round_name}-retry-high-chunk-{chunk_index}",
+                compact=True,
+                prior_layout=chunk_prior_layout,
+            ),
+            call_name,
+            max_network_retries=1,
+            max_degradation_attempts=1,
+        )
+        write_layout_chunk_cache(layout_gateway, cache_key, call_name, raw, audit_log)
+    layout = normalize_answer_layout(raw, items, source=f"retry_high_compact_visual_scan_{round_name}_{chunk_index}")
+    append_jsonl(
+        audit_log,
+        {
+            "event": "answer_layout_scan_retry_chunk_finished",
+            "time": utc_now(),
+            "round": round_name,
+            "chunk_index": chunk_index,
+            "total_chunks": total_chunks,
+            "page_numbers": layout_page_numbers(chunk),
+            "located_question_count": sum(1 for entry in layout.items.values() if normalized_layout_page_numbers(entry)),
+            "objective_answer_run_count": len(layout.objective_answer_runs),
+        },
+    )
+    return chunk_index, layout
+
+
+def scan_answer_layout_b_groups(
+    layout_gateway: ModelGateway,
+    items: list[AnswerItem],
+    visual_pages: list[VisualPage],
+    paper_id: str,
+    audit_log: Path,
+    prior_layout: AnswerLayout,
+    max_groups: int = LAYOUT_SCAN_B_PARALLEL_GROUPS,
+) -> tuple[AnswerLayout, dict[int, AnswerLayout]]:
+    groups = layout_verification_groups(items, visual_pages, prior_layout, max_groups=max_groups)
+    append_jsonl(
+        audit_log,
+        {
+            "event": "answer_layout_scan_b_group_dispatch_started",
+            "time": utc_now(),
+            "group_count": len(groups),
+            "parallelism": min(max_groups, len(groups)),
+            "groups": [
+                {
+                    "group_index": group["group_index"],
+                    "question_nos": group["question_nos"],
+                    "page_numbers": layout_page_numbers(group["pages"]),
+                }
+                for group in groups
+            ],
+        },
+    )
+    per_group: dict[int, AnswerLayout] = {}
+    errors: list[str] = []
+    failed_groups: list[dict[str, Any]] = []
+
+    def run_group(group: dict[str, Any]) -> tuple[int, AnswerLayout]:
+        idx = int(group["group_index"])
+        group_items = [item for item in items if item.question_no in set(group["question_nos"])]
+        visual_payload = visual_payload_for_layout_scan(
+            group["pages"],
+            compact=True,
+            chunk_index=idx,
+            total_chunks=len(groups),
+            total_page_count=len(visual_pages),
+        )
+        visual_payload["selection_reason"] = "a_round_guided_b_verification_group"
+        visual_payload["layout_scan_page_policy"]["verification_group_question_nos"] = group["question_nos"]
+        append_jsonl(
+            audit_log,
+            {
+                "event": "answer_layout_scan_b_group_started",
+                "time": utc_now(),
+                "group_index": idx,
+                "total_groups": len(groups),
+                "question_nos": group["question_nos"],
+                "page_numbers": layout_page_numbers(group["pages"]),
+                "reasoning_effort": layout_gateway.config.reasoning_effort,
+            },
+        )
+        group_prior_layout = layout_for_questions(prior_layout, group_items)
+        call_name = f"answer_layout_scan_B_group{idx}"
+        cache_key = layout_group_cache_key(layout_gateway, paper_id, idx, group, group_prior_layout)
+        raw = read_layout_chunk_cache(layout_gateway, cache_key, call_name, audit_log)
+        if raw is None:
+            raw = layout_gateway.call_json(
+                build_answer_layout_scan_messages(
+                    group_items,
+                    visual_payload,
+                    paper_id,
+                    scan_round=f"B-group-{idx}",
+                    compact=True,
+                    prior_layout=group_prior_layout,
+                    verification_group={
+                        "group_index": idx,
+                        "total_groups": len(groups),
+                        "question_nos": group["question_nos"],
+                        "page_numbers": layout_page_numbers(group["pages"]),
+                    },
+                ),
+                call_name,
+                max_network_retries=1,
+                max_degradation_attempts=1,
+            )
+            write_layout_chunk_cache(layout_gateway, cache_key, call_name, raw, audit_log)
+        layout = normalize_answer_layout(raw, group_items, source=f"a_round_guided_b_verification_group_{idx}")
+        layout = mark_b_verification_layout(
+            layout,
+            group_items,
+            note="B轮分组复核已覆盖本题；若未返回差异，则表示A轮定位未发现需改动处。",
+        )
+        append_jsonl(
+            audit_log,
+            {
+                "event": "answer_layout_scan_b_group_finished",
+                "time": utc_now(),
+                "group_index": idx,
+                "total_groups": len(groups),
+                "question_nos": group["question_nos"],
+                "page_numbers": layout_page_numbers(group["pages"]),
+                "delta_question_count": sum(
+                    1
+                    for entry in layout.items.values()
+                    if normalized_layout_page_numbers(entry) or ensure_list_of_dicts(entry.get("answer_boxes")) or entry.get("needs_human_review")
+                ),
+            },
+        )
+        return idx, layout
+
+    with ThreadPoolExecutor(max_workers=min(max_groups, len(groups))) as executor:
+        future_map = {executor.submit(run_group, group): group for group in groups}
+        for future in as_completed(future_map):
+            group = future_map[future]
+            try:
+                idx, layout = future.result()
+                per_group[idx] = layout
+            except Exception as exc:  # noqa: BLE001
+                error = f"group {group.get('group_index')} questions {group.get('question_nos')}: {type(exc).__name__}: {exc}"
+                errors.append(error)
+                failed_groups.append(group)
+                append_jsonl(
+                    audit_log,
+                    {
+                        "event": "answer_layout_scan_b_group_failed",
+                        "time": utc_now(),
+                        "group_index": group.get("group_index"),
+                        "question_nos": group.get("question_nos"),
+                        "page_numbers": layout_page_numbers(group.get("pages") or []),
+                        "error": error,
+                    },
+                )
+    if failed_groups:
+        recovered, retry_errors = retry_failed_b_groups_as_smaller_units(
+            layout_gateway,
+            items,
+            visual_pages,
+            paper_id,
+            audit_log,
+            prior_layout,
+            failed_groups,
+        )
+        for key, layout in recovered.items():
+            per_group[key] = layout
+        errors.extend(retry_errors)
+        failed_question_nos = uncovered_failed_b_questions(failed_groups, per_group)
+        if failed_question_nos:
+            failure_key = 9000 + len(per_group)
+            per_group[failure_key] = b_verification_failed_layout(failed_question_nos, items, errors)
+            append_jsonl(
+                audit_log,
+                {
+                    "event": "answer_layout_scan_b_question_verification_failed",
+                    "time": utc_now(),
+                    "question_nos": failed_question_nos,
+                    "reason": "B round group failed and split retry did not cover every question.",
+                },
+            )
+    if not per_group:
+        raise RuntimeError("B轮分组复核全部失败；" + "；".join(errors))
+    if errors:
+        append_jsonl(
+            audit_log,
+            {
+                "event": "answer_layout_scan_b_group_partial_failed",
+                "time": utc_now(),
+                "errors": errors,
+                "completed_group_count": len(per_group),
+                "total_groups": len(groups),
+            },
+        )
+    b_delta = merge_layout_chunks(
+        per_group,
+        items,
+        source="a_round_guided_b_parallel_delta_with_split_retry" if failed_groups else "a_round_guided_b_parallel_delta",
+    )
+    b_delta.global_notes = truncate_str("；".join([b_delta.global_notes, *errors]).strip("；"), 500)
+    return b_delta, per_group
+
+
+def retry_failed_b_groups_as_smaller_units(
+    layout_gateway: ModelGateway,
+    items: list[AnswerItem],
+    visual_pages: list[VisualPage],
+    paper_id: str,
+    audit_log: Path,
+    prior_layout: AnswerLayout,
+    failed_groups: list[dict[str, Any]],
+) -> tuple[dict[int, AnswerLayout], list[str]]:
+    recovered: dict[int, AnswerLayout] = {}
+    errors: list[str] = []
+    retry_groups = split_failed_b_groups(failed_groups, items, visual_pages, prior_layout)
+    if not retry_groups:
+        return recovered, errors
+    append_jsonl(
+        audit_log,
+        {
+            "event": "answer_layout_scan_b_retry_dispatch_started",
+            "time": utc_now(),
+            "retry_group_count": len(retry_groups),
+            "groups": [
+                {
+                    "group_index": group.get("group_index"),
+                    "retry_level": group.get("retry_level"),
+                    "question_nos": group.get("question_nos"),
+                    "page_numbers": layout_page_numbers(group.get("pages") or []),
+                }
+                for group in retry_groups
+            ],
+        },
+    )
+
+    def run_retry_group(group: dict[str, Any]) -> tuple[int, AnswerLayout]:
+        idx = int(group["group_index"])
+        group_items = [item for item in items if item.question_no in set(group["question_nos"])]
+        visual_payload = visual_payload_for_layout_scan(
+            group["pages"],
+            compact=True,
+            chunk_index=idx,
+            total_chunks=len(retry_groups),
+            total_page_count=len(visual_pages),
+        )
+        visual_payload["selection_reason"] = "b_failed_group_split_retry"
+        visual_payload["layout_scan_page_policy"]["verification_group_question_nos"] = group["question_nos"]
+        visual_payload["layout_scan_page_policy"]["retry_level"] = group.get("retry_level")
+        append_jsonl(
+            audit_log,
+            {
+                "event": "answer_layout_scan_b_retry_group_started",
+                "time": utc_now(),
+                "group_index": idx,
+                "retry_level": group.get("retry_level"),
+                "question_nos": group["question_nos"],
+                "page_numbers": layout_page_numbers(group["pages"]),
+                "reasoning_effort": layout_gateway.config.reasoning_effort,
+            },
+        )
+        group_prior_layout = layout_for_questions(prior_layout, group_items)
+        call_name = f"answer_layout_scan_B_retry_{idx}"
+        cache_key = layout_group_cache_key(layout_gateway, paper_id, idx, group, group_prior_layout)
+        raw = read_layout_chunk_cache(layout_gateway, cache_key, call_name, audit_log)
+        if raw is None:
+            raw = layout_gateway.call_json(
+                build_answer_layout_scan_messages(
+                    group_items,
+                    visual_payload,
+                    paper_id,
+                    scan_round=f"B-retry-{idx}",
+                    compact=True,
+                    prior_layout=group_prior_layout,
+                    verification_group={
+                        "group_index": idx,
+                        "retry_level": group.get("retry_level"),
+                        "total_groups": len(retry_groups),
+                        "question_nos": group["question_nos"],
+                        "page_numbers": layout_page_numbers(group["pages"]),
+                    },
+                ),
+                call_name,
+                max_network_retries=1,
+                max_degradation_attempts=1,
+            )
+            write_layout_chunk_cache(layout_gateway, cache_key, call_name, raw, audit_log)
+        layout = normalize_answer_layout(raw, group_items, source=f"b_failed_group_split_retry_{idx}")
+        layout = mark_b_verification_layout(
+            layout,
+            group_items,
+            note="B轮失败组拆小重试已覆盖本题；若未返回差异，则表示A轮定位未发现需改动处。",
+        )
+        append_jsonl(
+            audit_log,
+            {
+                "event": "answer_layout_scan_b_retry_group_finished",
+                "time": utc_now(),
+                "group_index": idx,
+                "retry_level": group.get("retry_level"),
+                "question_nos": group["question_nos"],
+                "page_numbers": layout_page_numbers(group["pages"]),
+                "delta_question_count": sum(
+                    1
+                    for entry in layout.items.values()
+                    if normalized_layout_page_numbers(entry) or ensure_list_of_dicts(entry.get("answer_boxes")) or entry.get("needs_human_review")
+                ),
+            },
+        )
+        return idx, layout
+
+    with ThreadPoolExecutor(max_workers=min(LAYOUT_SCAN_B_PARALLEL_GROUPS, len(retry_groups))) as executor:
+        future_map = {executor.submit(run_retry_group, group): group for group in retry_groups}
+        for future in as_completed(future_map):
+            group = future_map[future]
+            try:
+                idx, layout = future.result()
+                recovered[idx] = layout
+            except Exception as exc:  # noqa: BLE001
+                error = f"B retry {group.get('retry_level')} group {group.get('group_index')} questions {group.get('question_nos')}: {type(exc).__name__}: {exc}"
+                errors.append(error)
+                append_jsonl(
+                    audit_log,
+                    {
+                        "event": "answer_layout_scan_b_retry_group_failed",
+                        "time": utc_now(),
+                        "group_index": group.get("group_index"),
+                        "retry_level": group.get("retry_level"),
+                        "question_nos": group.get("question_nos"),
+                        "page_numbers": layout_page_numbers(group.get("pages") or []),
+                        "error": error,
+                    },
+                )
+    return recovered, errors
+
+
+def mark_b_verification_layout(layout: AnswerLayout, group_items: list[AnswerItem], note: str) -> AnswerLayout:
+    marked: dict[str, dict[str, Any]] = {}
+    for item in group_items:
+        entry = dict(layout.items.get(item.question_no, {}))
+        returned = bool(entry.get("returned_by_model")) and bool(
+            normalized_layout_page_numbers(entry)
+            or ensure_list_of_dicts(entry.get("answer_boxes"))
+            or str(entry.get("recognized_answer_brief") or "").strip()
+            or bool(entry.get("needs_human_review"))
+        )
+        entry.setdefault("question_no", item.question_no)
+        entry.setdefault("question_type", item.question_type)
+        entry["b_verification_covered"] = True
+        entry["b_verification_failed"] = False
+        if not returned:
+            entry["page_numbers"] = []
+            entry["answer_boxes"] = []
+            entry["recognized_answer_brief"] = ""
+            entry["needs_human_review"] = False
+            entry["confidence"] = max(layout_entry_confidence(entry), 0.72)
+            entry["notes"] = note
+            entry["returned_by_model"] = False
+        else:
+            entry["notes"] = truncate_str(
+                "；".join(value for value in [str(entry.get("notes") or ""), "B轮复核返回差异、补漏或风险标记"] if value),
+                220,
+            )
+        marked[item.question_no] = entry
+    return AnswerLayout(
+        items=marked,
+        global_notes=layout.global_notes,
+        source=layout.source,
+        objective_answer_runs=layout.objective_answer_runs,
+    )
+
+
+def uncovered_failed_b_questions(failed_groups: list[dict[str, Any]], layouts: dict[int, AnswerLayout]) -> list[str]:
+    failed_question_nos = {
+        str(question_no)
+        for group in failed_groups
+        for question_no in ensure_list(group.get("question_nos"))
+        if str(question_no).strip()
+    }
+    covered_question_nos: set[str] = set()
+    for layout in layouts.values():
+        for question_no, entry in layout.items.items():
+            if entry.get("b_verification_covered") and not entry.get("b_verification_failed"):
+                covered_question_nos.add(str(question_no))
+    return sorted(failed_question_nos - covered_question_nos, key=lambda value: safe_int_or_none(value) or 999)
+
+
+def b_verification_failed_layout(question_nos: list[str], items: list[AnswerItem], errors: list[str]) -> AnswerLayout:
+    wanted = {item.question_no: item for item in items}
+    rows: dict[str, dict[str, Any]] = {}
+    reason = truncate_str("B轮分组复核及拆小重试未覆盖本题；保留A轮定位，但证据质量降级。", 220)
+    for question_no in question_nos:
+        item = wanted.get(str(question_no))
+        if item is None:
+            continue
+        rows[item.question_no] = {
+            "question_no": item.question_no,
+            "question_type": item.question_type,
+            "page_numbers": [],
+            "answer_order_index": None,
+            "answer_boxes": [],
+            "recognized_answer_brief": "",
+            "is_out_of_order": False,
+            "needs_human_review": True,
+            "confidence": 0.0,
+            "notes": reason,
+            "returned_by_model": False,
+            "b_verification_covered": False,
+            "b_verification_failed": True,
+        }
+    return AnswerLayout(
+        items=rows,
+        global_notes=truncate_str("；".join([reason, *errors[-3:]]), 500),
+        source="b_failed_group_uncovered_questions",
+        objective_answer_runs=[],
+    )
+
+
+def layout_verification_groups(
+    items: list[AnswerItem],
+    visual_pages: list[VisualPage],
+    prior_layout: AnswerLayout,
+    max_groups: int = LAYOUT_SCAN_B_PARALLEL_GROUPS,
+) -> list[dict[str, Any]]:
+    rows: list[tuple[AnswerItem, list[int], tuple[int, int, int]]] = []
+    all_page_numbers = layout_page_numbers(visual_pages)
+    fallback_page = all_page_numbers[:1] or []
+    for item in sorted(items, key=lambda row: safe_int_or_none(row.question_no) or 999):
+        entry = prior_layout.items.get(item.question_no, {})
+        page_numbers = normalized_layout_page_numbers(entry)
+        order_index = safe_int_or_none(entry.get("answer_order_index")) or safe_int_or_none(item.question_no) or 999
+        page_rank = min(page_numbers) if page_numbers else 9999
+        q_rank = safe_int_or_none(item.question_no) or 999
+        rows.append((item, page_numbers or fallback_page, (page_rank, order_index, q_rank)))
+    ordered = sorted(rows, key=lambda row: row[2])
+    group_count = max(1, min(max_groups, len(ordered)))
+    target_size = max(1, math.ceil(len(ordered) / group_count))
+    buckets: list[list[tuple[AnswerItem, list[int], tuple[int, int, int]]]] = [
+        ordered[index : index + target_size] for index in range(0, len(ordered), target_size)
+    ]
+    while len(buckets) > group_count:
+        tail = buckets.pop()
+        buckets[-1].extend(tail)
+    pages_by_no = {int(page.page_no): page for page in visual_pages}
+    groups = []
+    for idx, bucket in enumerate(buckets, start=1):
+        if not bucket:
+            continue
+        question_nos = [item.question_no for item, _, _ in bucket]
+        page_numbers = sorted({page_no for _, nums, _ in bucket for page_no in nums})
+        selected_pages = [pages_by_no[num] for num in page_numbers if num in pages_by_no]
+        if not selected_pages and visual_pages:
+            selected_pages = visual_pages[:1]
+        groups.append({"group_index": idx, "question_nos": question_nos, "pages": selected_pages})
+    return groups
+
+
+def split_failed_b_groups(
+    failed_groups: list[dict[str, Any]],
+    items: list[AnswerItem],
+    visual_pages: list[VisualPage],
+    prior_layout: AnswerLayout,
+) -> list[dict[str, Any]]:
+    by_no = {item.question_no: item for item in items}
+    pages_by_no = {int(page.page_no): page for page in visual_pages}
+    retry_groups: list[dict[str, Any]] = []
+    next_index = 100
+    single_count = 0
+    for group in failed_groups:
+        question_nos = [str(no) for no in ensure_list(group.get("question_nos")) if str(no) in by_no]
+        if not question_nos:
+            continue
+        chunks = [
+            question_nos[index : index + LAYOUT_SCAN_B_RETRY_GROUP_SIZE]
+            for index in range(0, len(question_nos), LAYOUT_SCAN_B_RETRY_GROUP_SIZE)
+        ]
+        for chunk in chunks:
+            page_numbers = pages_for_question_nos(chunk, prior_layout)
+            selected_pages = [pages_by_no[num] for num in page_numbers if num in pages_by_no]
+            if not selected_pages:
+                selected_pages = group.get("pages") or visual_pages[:1]
+            next_index += 1
+            retry_groups.append(
+                {
+                    "group_index": next_index,
+                    "retry_level": "small_group",
+                    "question_nos": chunk,
+                    "pages": selected_pages,
+                }
+            )
+        for question_no in question_nos:
+            if single_count >= LAYOUT_SCAN_B_SINGLE_RETRY_LIMIT:
+                break
+            page_numbers = pages_for_question_nos([question_no], prior_layout)
+            selected_pages = [pages_by_no[num] for num in page_numbers if num in pages_by_no]
+            if not selected_pages:
+                selected_pages = group.get("pages") or visual_pages[:1]
+            next_index += 1
+            single_count += 1
+            retry_groups.append(
+                {
+                    "group_index": next_index,
+                    "retry_level": "single_question",
+                    "question_nos": [question_no],
+                    "pages": selected_pages,
+                }
+            )
+    return retry_groups
+
+
+def pages_for_question_nos(question_nos: list[str], layout: AnswerLayout) -> list[int]:
+    page_numbers: list[int] = []
+    for question_no in question_nos:
+        entry = layout.items.get(question_no, {})
+        for page_no in normalized_layout_page_numbers(entry):
+            if page_no not in page_numbers:
+                page_numbers.append(page_no)
+    return sorted(page_numbers)
+
+
+def layout_for_questions(layout: AnswerLayout | None, items: list[AnswerItem]) -> AnswerLayout | None:
+    if layout is None:
+        return None
+    wanted = {item.question_no for item in items}
+    return AnswerLayout(
+        items={question_no: entry for question_no, entry in layout.items.items() if question_no in wanted},
+        global_notes=layout.global_notes,
+        source=layout.source,
+        objective_answer_runs=layout.objective_answer_runs,
+    )
+
+
+def layout_group_cache_key(
+    layout_gateway: ModelGateway,
+    paper_id: str,
+    group_index: int,
+    group: dict[str, Any],
+    prior_layout: AnswerLayout | None,
+) -> str:
+    chunk = group.get("pages") or []
+    payload = {
+        "cache_version": "layout-b-group-v1-a-guided",
+        "paper_id": paper_id,
+        "group_index": group_index,
+        "question_nos": group.get("question_nos") or [],
+        "model": layout_gateway.config.model,
+        "api_mode": layout_gateway.config.api_mode,
+        "reasoning_effort": layout_gateway.config.reasoning_effort,
+        "max_output_tokens": layout_gateway.config.max_output_tokens,
+        "pages": [
+            {
+                "source_pdf_name": Path(page.source_pdf).name,
+                "source_pdf_hash": short_file_hash(Path(page.source_pdf)),
+                "page_no": page.page_no,
+                "image_hash": short_file_hash(Path(page.image_path)),
+            }
+            for page in chunk
+        ],
+        "prior_layout_hash": hashlib.sha1(json.dumps(stable_answer_layout_for_prompt(prior_layout), ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        if prior_layout is not None
+        else "",
+    }
+    text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def scan_answer_layout_compact_fallback(
     gateway: ModelGateway,
     items: list[AnswerItem],
@@ -2711,8 +4187,13 @@ def scan_answer_layout_compact_fallback(
     audit_log: Path,
     previous_errors: list[str],
 ) -> AnswerLayout | None:
-    compact_payload = visual_payload_for_layout_scan(visual_pages, compact=True)
-    compact_gateway = gateway.with_overrides(reasoning_effort="high", max_output_tokens=LAYOUT_SCAN_COMPACT_MAX_OUTPUT_TOKENS, use_stream=True)
+    page_chunks = layout_scan_page_chunks(visual_pages)
+    compact_gateway = gateway.with_overrides(
+        reasoning_effort="high",
+        max_output_tokens=LAYOUT_SCAN_COMPACT_MAX_OUTPUT_TOKENS,
+        timeout_seconds=STREAM_TOTAL_TIMEOUT_LAYOUT_SECONDS,
+        use_stream=True,
+    )
     append_jsonl(
         audit_log,
         {
@@ -2720,26 +4201,39 @@ def scan_answer_layout_compact_fallback(
             "time": utc_now(),
             "question_count": len(items),
             "page_count": len(visual_pages),
-            "layout_payload_pages": len(compact_payload.get("pages") or []),
+            "layout_chunk_count": len(page_chunks),
+            "chunk_page_numbers": [layout_page_numbers(chunk) for chunk in page_chunks],
             "reasoning_effort": compact_gateway.config.reasoning_effort,
             "max_output_tokens": compact_gateway.config.max_output_tokens,
             "previous_errors": previous_errors,
         },
     )
     try:
-        raw = compact_gateway.call_json(
-            build_answer_layout_scan_messages(items, compact_payload, paper_id, scan_round="compact", compact=True),
-            "answer_layout_scan_compact",
-            max_network_retries=1,
-            max_degradation_attempts=1,
-        )
-        layout = normalize_answer_layout(raw, items, source="single_high_compact_visual_scan_fallback")
+        per_chunk: dict[int, AnswerLayout] = {}
+        for idx, chunk in enumerate(page_chunks, start=1):
+            compact_payload = visual_payload_for_layout_scan(
+                chunk,
+                compact=True,
+                chunk_index=idx,
+                total_chunks=len(page_chunks),
+                total_page_count=len(visual_pages),
+            )
+            raw = compact_gateway.call_json(
+                build_answer_layout_scan_messages(items, compact_payload, paper_id, scan_round=f"compact-chunk-{idx}", compact=True),
+                f"answer_layout_scan_compact_chunk{idx}",
+                max_network_retries=1,
+                max_degradation_attempts=1,
+            )
+            per_chunk[idx] = normalize_answer_layout(raw, items, source=f"single_high_compact_visual_scan_fallback_{idx}")
+        if len(per_chunk) != len(page_chunks):
+            raise RuntimeError("紧凑high兜底未完整覆盖全部页面块")
+        layout = merge_layout_chunks(per_chunk, items, source="chunked_high_compact_visual_scan_fallback")
         layout.global_notes = truncate_str(
             "；".join(
                 value
                 for value in [
                     layout.global_notes,
-                    "双xhigh布局扫描超时后启用紧凑high定位；未定位题不得使用固定模板裁剪。",
+                    "双xhigh布局扫描失败后启用全页分块紧凑high定位；未定位题不得使用固定模板裁剪。",
                 ]
                 if value
             ),
@@ -2754,6 +4248,8 @@ def scan_answer_layout_compact_fallback(
                 "objective_answer_run_count": len(layout.objective_answer_runs),
                 "global_notes": layout.global_notes,
                 "source": layout.source,
+                "layout_chunk_count": len(page_chunks),
+                "covered_page_numbers": layout_scan_coverage(page_chunks),
             },
         )
         return layout
@@ -2786,7 +4282,7 @@ def normalize_answer_layout(raw: dict[str, Any], items: list[AnswerItem], source
             continue
         row_page_numbers = normalized_layout_page_numbers(row)
         answer_boxes = []
-        for raw_box in ensure_list_of_dicts(row.get("answer_boxes"))[:3]:
+        for raw_box in ensure_list_of_dicts(row.get("answer_boxes"))[:LAYOUT_SCAN_MAX_BOXES_PER_QUESTION]:
             box = normalize_ratio_box(raw_box.get("box"))
             if box is None:
                 box = normalize_ratio_box([raw_box.get("x1"), raw_box.get("y1"), raw_box.get("x2"), raw_box.get("y2")])
@@ -2811,6 +4307,7 @@ def normalize_answer_layout(raw: dict[str, Any], items: list[AnswerItem], source
             "needs_human_review": bool(row.get("needs_human_review", False)),
             "confidence": layout_entry_confidence(row),
             "notes": truncate_str(str(row.get("notes") or ""), 220),
+            "returned_by_model": True,
         }
         if not entry["page_numbers"]:
             entry["page_numbers"] = sorted({box["page_no"] for box in answer_boxes})
@@ -2829,6 +4326,7 @@ def normalize_answer_layout(raw: dict[str, Any], items: list[AnswerItem], source
                 "needs_human_review": True,
                 "confidence": 0.0,
                 "notes": "视觉预读未返回该题位置",
+                "returned_by_model": False,
             },
         )
     return AnswerLayout(
@@ -2836,6 +4334,135 @@ def normalize_answer_layout(raw: dict[str, Any], items: list[AnswerItem], source
         global_notes=truncate_str(str(raw.get("global_notes") or ""), 500),
         source=source,
         objective_answer_runs=normalize_objective_answer_runs(raw.get("objective_answer_runs")),
+    )
+
+
+def merge_layout_chunks(chunks: dict[int, AnswerLayout], items: list[AnswerItem], source: str) -> AnswerLayout:
+    merged: dict[str, dict[str, Any]] = {}
+    for item in items:
+        candidates = [layout.items.get(item.question_no, {}) for _, layout in sorted(chunks.items())]
+        present = [
+            entry
+            for entry in candidates
+            if normalized_layout_page_numbers(entry)
+            or ensure_list_of_dicts(entry.get("answer_boxes"))
+            or entry.get("b_verification_covered")
+            or entry.get("b_verification_failed")
+        ]
+        if not present:
+            merged[item.question_no] = {
+                "question_no": item.question_no,
+                "question_type": item.question_type,
+                "page_numbers": [],
+                "answer_order_index": None,
+                "answer_boxes": [],
+                "recognized_answer_brief": "",
+                "is_out_of_order": False,
+                "needs_human_review": True,
+                "confidence": 0.0,
+                "notes": "全页分块视觉预读未返回该题位置",
+                "layout_chunks": {
+                    str(idx): stable_layout_entry(item.question_no, layout.items.get(item.question_no, {}))
+                    for idx, layout in sorted(chunks.items())
+                },
+            }
+            continue
+        locating_present = [
+            entry
+            for entry in present
+            if normalized_layout_page_numbers(entry) or ensure_list_of_dicts(entry.get("answer_boxes"))
+        ]
+        best_source = max(locating_present or present, key=layout_entry_confidence)
+        best = dict(best_source)
+        page_numbers = sorted({page for entry in present for page in normalized_layout_page_numbers(entry)})
+        boxes: list[dict[str, Any]] = []
+        seen_boxes: set[str] = set()
+        for entry in sorted(present, key=lambda row: (normalized_layout_page_numbers(row) or [999])[0]):
+            for raw_box in ensure_list_of_dicts(entry.get("answer_boxes")):
+                box = normalize_ratio_box(raw_box.get("box"))
+                page_no = safe_int_or_none(raw_box.get("page_no") or entry.get("page_no"))
+                if box is None or page_no is None:
+                    continue
+                key = f"{page_no}:{','.join(f'{value:.3f}' for value in box)}"
+                if key in seen_boxes:
+                    continue
+                seen_boxes.add(key)
+                boxes.append({"page_no": page_no, "box": list(box)})
+        best["page_numbers"] = page_numbers
+        best["answer_boxes"] = boxes[:LAYOUT_SCAN_MAX_BOXES_PER_QUESTION]
+        best["confidence"] = max(layout_entry_confidence(entry) for entry in locating_present or present)
+        best["b_verification_covered"] = any(bool(entry.get("b_verification_covered")) for entry in present)
+        best["b_verification_failed"] = any(bool(entry.get("b_verification_failed")) for entry in present)
+        if best["b_verification_failed"]:
+            best["needs_human_review"] = True
+        elif best["b_verification_covered"] and not page_numbers and not boxes:
+            best["needs_human_review"] = False
+            best["confidence"] = max(best["confidence"], 0.72)
+        else:
+            best["needs_human_review"] = bool(best.get("needs_human_review")) or len(present) > 1
+        best["notes"] = truncate_str(
+            "；".join(
+                value
+                for value in [
+                    str(best.get("notes") or ""),
+                    "B轮已覆盖本题且未发现A轮定位差异" if best["b_verification_covered"] and not page_numbers and not boxes else "",
+                    "B轮本题复核失败，保留A轮定位并标记证据风险" if best["b_verification_failed"] else "",
+                    "跨页/多块检测到本题，已合并候选框" if len(present) > 1 else "",
+                ]
+                if value
+            ),
+            220,
+        )
+        best["layout_chunks"] = {
+            str(idx): stable_layout_entry(item.question_no, layout.items.get(item.question_no, {}))
+            for idx, layout in sorted(chunks.items())
+        }
+        merged[item.question_no] = best
+    objective_runs: list[dict[str, Any]] = []
+    seen_runs: set[str] = set()
+    for _, layout in sorted(chunks.items()):
+        for run in layout.objective_answer_runs:
+            key = f"{run.get('question_range')}:{run.get('answers')}:{run.get('page_no')}"
+            if key in seen_runs:
+                continue
+            seen_runs.add(key)
+            objective_runs.append(run)
+    notes = "；".join(layout.global_notes for _, layout in sorted(chunks.items()) if layout.global_notes)
+    return AnswerLayout(
+        items=merged,
+        global_notes=truncate_str(notes, 500),
+        source=source,
+        objective_answer_runs=objective_runs[:8],
+    )
+
+
+def layout_for_chunk(layout: AnswerLayout | None, chunk: list[VisualPage], items: list[AnswerItem]) -> AnswerLayout | None:
+    if layout is None:
+        return None
+    chunk_pages = set(layout_page_numbers(chunk))
+    filtered: dict[str, dict[str, Any]] = {}
+    for item in items:
+        entry = layout.items.get(item.question_no, {})
+        pages = set(normalized_layout_page_numbers(entry))
+        boxes = [
+            raw_box
+            for raw_box in ensure_list_of_dicts(entry.get("answer_boxes"))
+            if safe_int_or_none(raw_box.get("page_no") or entry.get("page_no")) in chunk_pages
+        ]
+        if pages & chunk_pages or boxes:
+            copied = dict(entry)
+            copied["page_numbers"] = sorted(pages & chunk_pages) or sorted({safe_int_or_none(box.get("page_no")) for box in boxes if safe_int_or_none(box.get("page_no"))})
+            copied["answer_boxes"] = boxes
+            filtered[item.question_no] = copied
+    return AnswerLayout(
+        items=filtered,
+        global_notes=layout.global_notes,
+        source=layout.source,
+        objective_answer_runs=[
+            run
+            for run in layout.objective_answer_runs
+            if safe_int_or_none(run.get("page_no")) in chunk_pages
+        ],
     )
 
 
@@ -2870,12 +4497,49 @@ def normalize_objective_answer_runs(value: Any) -> list[dict[str, Any]]:
 
 def merge_answer_layouts(first: AnswerLayout, second: AnswerLayout, items: list[AnswerItem]) -> AnswerLayout:
     merged: dict[str, dict[str, Any]] = {}
+    second_is_delta = second.source in {"a_round_guided_b_parallel_delta", "a_round_guided_b_parallel_delta_with_split_retry"}
     for item in items:
         a = first.items.get(item.question_no, {})
         b = second.items.get(item.question_no, {})
-        chosen = dict(a if layout_entry_confidence(a) >= layout_entry_confidence(b) else b)
-        same_pages = normalized_layout_page_numbers(a) == normalized_layout_page_numbers(b)
-        same_brief = compact_answer_text(a.get("recognized_answer_brief")) == compact_answer_text(b.get("recognized_answer_brief"))
+        b_has_delta = bool(
+            normalized_layout_page_numbers(b)
+            or ensure_list_of_dicts(b.get("answer_boxes"))
+            or (
+                b.get("returned_by_model")
+                and (
+                    b.get("needs_human_review")
+                    or str(b.get("recognized_answer_brief") or "").strip()
+                    or str(b.get("notes") or "").strip()
+                )
+            )
+        )
+        if second_is_delta and not b_has_delta:
+            chosen = dict(a)
+            same_pages = True
+            same_brief = True
+            b_round_state = stable_layout_entry(item.question_no, b)
+            if b.get("b_verification_failed"):
+                chosen["confidence"] = min(layout_entry_confidence(chosen), 0.62)
+                chosen["needs_human_review"] = True
+                chosen["b_verification_failed"] = True
+                chosen["notes"] = truncate_str(
+                    (str(chosen.get("notes") or "") + "；B轮未能完成本题复核，保留A轮定位并降低证据置信度。").strip("；"),
+                    220,
+                )
+            elif b.get("b_verification_covered"):
+                chosen["b_verification_covered"] = True
+        else:
+            chosen = dict(a if layout_entry_confidence(a) >= layout_entry_confidence(b) else b)
+            same_pages = normalized_layout_page_numbers(a) == normalized_layout_page_numbers(b)
+            same_brief = compact_answer_text(a.get("recognized_answer_brief")) == compact_answer_text(b.get("recognized_answer_brief"))
+            b_round_state = stable_layout_entry(item.question_no, b)
+            if b.get("needs_human_review") and b.get("returned_by_model"):
+                chosen["needs_human_review"] = True
+                chosen["confidence"] = min(layout_entry_confidence(chosen), 0.58)
+                chosen["notes"] = truncate_str(
+                    (str(chosen.get("notes") or "") + "；B轮复核返回风险标记，需后续单题视觉或人工核验。").strip("；"),
+                    220,
+                )
         if not same_pages or (item.question_type in {"objective", "blank"} and not same_brief):
             chosen["confidence"] = min(layout_entry_confidence(chosen), 0.58)
             chosen["needs_human_review"] = True
@@ -2885,10 +4549,29 @@ def merge_answer_layouts(first: AnswerLayout, second: AnswerLayout, items: list[
             )
         chosen["layout_rounds"] = {
             "A": stable_layout_entry(item.question_no, a),
-            "B": stable_layout_entry(item.question_no, b),
+            "B": b_round_state
+            if b_has_delta or b.get("b_verification_covered") or b.get("b_verification_failed")
+            else {"verified_no_delta": True},
         }
         merged[item.question_no] = chosen
-    objective_runs = merge_objective_answer_runs(first.objective_answer_runs, second.objective_answer_runs)
+    b_verified_question_nos = {
+        item.question_no
+        for item in items
+        if isinstance(second.items.get(item.question_no), dict)
+        and second.items.get(item.question_no, {}).get("b_verification_covered")
+    }
+    b_failed_question_nos = {
+        item.question_no
+        for item in items
+        if isinstance(second.items.get(item.question_no), dict)
+        and second.items.get(item.question_no, {}).get("b_verification_failed")
+    }
+    objective_runs = merge_objective_answer_runs(
+        first.objective_answer_runs,
+        second.objective_answer_runs,
+        b_verified_question_nos=b_verified_question_nos,
+        b_failed_question_nos=b_failed_question_nos,
+    )
     notes = "；".join(value for value in [first.global_notes, second.global_notes] if value)
     return AnswerLayout(
         items=merged,
@@ -2902,9 +4585,16 @@ def compact_answer_text(value: Any) -> str:
     return re.sub(r"\s+", "", str(value or "")).upper()
 
 
-def merge_objective_answer_runs(first: list[dict[str, Any]], second: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def merge_objective_answer_runs(
+    first: list[dict[str, Any]],
+    second: list[dict[str, Any]],
+    b_verified_question_nos: set[str] | None = None,
+    b_failed_question_nos: set[str] | None = None,
+) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     seen: set[str] = set()
+    b_verified_question_nos = b_verified_question_nos or set()
+    b_failed_question_nos = b_failed_question_nos or set()
     for run in [*first, *second]:
         key = f"{run.get('question_range')}:{run.get('answers')}"
         if key in seen:
@@ -2918,15 +4608,40 @@ def merge_objective_answer_runs(first: list[dict[str, Any]], second: list[dict[s
             and str(other.get("answers") or "") == str(run.get("answers") or "")
         ]
         row = dict(run)
-        if matching:
-            row["confidence"] = max(float(row.get("confidence") or 0), float(matching[0].get("confidence") or 0))
+        range_question_nos = objective_question_nos_from_run(row)
+        has_b_verified_range = bool(range_question_nos) and all(no in b_verified_question_nos for no in range_question_nos)
+        has_b_failed_range = bool(range_question_nos) and any(no in b_failed_question_nos for no in range_question_nos)
+        if matching or (run in first and has_b_verified_range and not has_b_failed_range):
+            matched_confidence = float(matching[0].get("confidence") or 0) if matching else 0.0
+            row["confidence"] = max(float(row.get("confidence") or 0), matched_confidence, 0.72 if has_b_verified_range else 0.0)
             row["verified_by_dual_scan"] = True
         else:
             row["confidence"] = min(float(row.get("confidence") or 0), 0.62)
             row["verified_by_dual_scan"] = False
-            row["notes"] = truncate_str((str(row.get("notes") or "") + "；仅一轮xhigh读到该答案串。").strip("；"), 120)
+            row["notes"] = truncate_str(
+                (
+                    str(row.get("notes") or "")
+                    + ("；B轮对应题号复核失败。" if has_b_failed_range else "；仅一轮xhigh读到该答案串。")
+                ).strip("；"),
+                120,
+            )
         rows.append(row)
     return rows[:6]
+
+
+def objective_question_nos_from_run(run: dict[str, Any]) -> list[str]:
+    answers = str(run.get("answers") or "").strip().upper()
+    range_text = str(run.get("question_range") or "")
+    nums = [int(value) for value in re.findall(r"\d{1,2}", range_text)]
+    if len(nums) >= 2:
+        start, end = nums[0], nums[1]
+    elif len(nums) == 1 and answers:
+        start, end = nums[0], nums[0] + len(answers) - 1
+    else:
+        return []
+    if not (1 <= start <= end <= 10):
+        return []
+    return [str(value) for value in range(start, end + 1)]
 
 
 def safe_int_or_none(value: Any) -> int | None:
@@ -4193,6 +5908,21 @@ def attach_common_result_metadata(
     result["question_sources"] = (question_reference or {}).get("sources", [])
     if visual_sources is not None:
         result["visual_sources"] = visual_sources
+        evidence_state = visual_sources.get("evidence_state") if isinstance(visual_sources, dict) else None
+        if isinstance(evidence_state, dict):
+            result["evidence_state"] = evidence_state
+            if evidence_state.get("must_human_review"):
+                result["needs_human_review"] = True
+                reason_text = "；".join(str(item) for item in ensure_list(evidence_state.get("reasons")) if str(item).strip())
+                result["review_reason"] = (
+                    ((result.get("review_reason") + "；") if result.get("review_reason") else "")
+                    + (reason_text or "证据状态不足，需人工复核。")
+                )
+                result["confidence"] = min(float(result.get("confidence") or 0.0), 0.35)
+            elif evidence_state.get("status") == "usable_with_warning":
+                reason_text = "；".join(str(item) for item in ensure_list(evidence_state.get("reasons")) if str(item).strip())
+                if reason_text and not result.get("review_reason"):
+                    result["review_reason"] = reason_text
     return result
 
 
@@ -4763,6 +6493,66 @@ def grade_one_item_for_run(
     return result
 
 
+def preflight_model_gateway(gateway: ModelGateway, audit_log: Path) -> None:
+    if not gateway.config.api_url or not gateway.config.api_key:
+        return
+    preflight_gateway = gateway.with_overrides(
+        reasoning_effort="low",
+        max_output_tokens=80,
+        timeout_seconds=min(max(20, gateway.config.timeout_seconds), 45),
+        use_stream=False,
+        use_cache=False,
+    )
+    append_jsonl(
+        audit_log,
+        {
+            "event": "model_preflight_started",
+            "time": utc_now(),
+            "api_mode": preflight_gateway.config.api_mode,
+            "model": preflight_gateway.config.model,
+            "api_url_count": len(preflight_gateway.api_urls),
+        },
+    )
+    try:
+        raw = preflight_gateway.call_json(
+            [
+                {
+                    "role": "system",
+                    "content": "你是连通性测试器。只输出合法 JSON。",
+                },
+                {
+                    "role": "user",
+                    "content": "输出 {\"ok\": true}，不要输出其他内容。",
+                },
+            ],
+            "model_preflight",
+            max_network_retries=1,
+            max_degradation_attempts=1,
+        )
+    except Exception as exc:  # noqa: BLE001
+        error = f"{type(exc).__name__}: {exc}"
+        append_jsonl(
+            audit_log,
+            {
+                "event": "model_preflight_failed",
+                "time": utc_now(),
+                "error": error,
+            },
+        )
+        raise RuntimeError(
+            "模型生成接口预检失败：当前 API URL/API Key/模型组合不能返回最小 JSON，已停止整卷阅卷以避免无效请求。"
+            f" 原因：{error}"
+        ) from exc
+    append_jsonl(
+        audit_log,
+        {
+            "event": "model_preflight_finished",
+            "time": utc_now(),
+            "response": raw,
+        },
+    )
+
+
 def reasoning_effort_for_item(config: ModelConfig, item: AnswerItem) -> str:
     if item.question_type == "objective":
         return config.objective_reasoning_effort or config.reasoning_effort
@@ -4815,16 +6605,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--run-id", default=None, help="Optional stable run id. Used by the local web UI.")
     parser.add_argument("--policy-path", default=str(DEFAULT_POLICY_PATH), help="Global grading policy distilled from exam analysis.")
     default_layout_scan = os.getenv("GRADER_LAYOUT_SCAN", "1").lower() in {"1", "true", "yes", "on"}
-    parser.add_argument("--layout-scan", dest="layout_scan", action="store_true", default=default_layout_scan, help="Run one xhigh whole-paper visual pass to locate each student's answer order and answer boxes before grading.")
+    parser.add_argument("--layout-scan", dest="layout_scan", action="store_true", default=default_layout_scan, help="Run page-local visual layout scans to locate each student's answer order and answer boxes before grading.")
     parser.add_argument("--no-layout-scan", dest="layout_scan", action="store_false", help="Disable the whole-paper visual layout pre-scan and use heuristic page selection.")
-    parser.add_argument("--concurrency", type=int, default=int(os.getenv("GRADER_CONCURRENCY", "10")), help="Total grading task concurrency.")
-    parser.add_argument("--blank-concurrency", type=int, default=int(os.getenv("GRADER_BLANK_CONCURRENCY", "3")), help="Maximum blank questions to grade concurrently.")
-    parser.add_argument("--solution-concurrency", type=int, default=int(os.getenv("GRADER_SOLUTION_CONCURRENCY", "6")), help="Maximum solution questions to grade concurrently.")
+    parser.add_argument("--concurrency", type=int, default=int(os.getenv("GRADER_CONCURRENCY", "6")), help="Total grading task concurrency.")
+    parser.add_argument("--blank-concurrency", type=int, default=int(os.getenv("GRADER_BLANK_CONCURRENCY", "2")), help="Maximum blank questions to grade concurrently.")
+    parser.add_argument("--solution-concurrency", type=int, default=int(os.getenv("GRADER_SOLUTION_CONCURRENCY", "3")), help="Maximum solution questions to grade concurrently.")
     return parser.parse_args(argv)
 
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    args.concurrency = min(max(1, int(args.concurrency)), 6)
+    args.blank_concurrency = min(max(1, int(args.blank_concurrency)), args.concurrency)
+    args.solution_concurrency = min(max(1, int(args.solution_concurrency)), args.concurrency)
     run_id = args.run_id or (datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8])
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id):
         raise ValueError("--run-id may contain only letters, numbers, underscore, dot, and hyphen")
@@ -4980,6 +6773,7 @@ def main(argv: list[str]) -> int:
         ),
         audit_log=audit_log,
     )
+    preflight_model_gateway(gateway, audit_log)
 
     answer_layout: AnswerLayout | None = None
     if bool(args.layout_scan) and visual_pages:
@@ -5004,6 +6798,7 @@ def main(argv: list[str]) -> int:
 
     question_results: list[dict[str, Any]] = []
     max_workers = max(1, int(args.concurrency))
+    max_workers = min(max_workers, 6)
     objective_items = [item for item in parsed_items if item.question_type == "objective"]
     blank_items = [item for item in parsed_items if item.question_type == "blank"]
     solution_items = [item for item in parsed_items if item.question_type == "solution"]
@@ -5013,13 +6808,22 @@ def main(argv: list[str]) -> int:
         extra_objective_items = objective_items
     grading_task_count = len(extra_objective_items) + len(blank_items) + len(solution_items) + (1 if args.objective_batch_mode and objective_items else 0)
     review_multiplier = 1 if args.single_review else (2 if args.parallel_visual_rounds else 1)
-    effective_task_concurrency = min(
-        max_workers,
-        (1 if args.objective_batch_mode and objective_items else 0)
-        + min(max(1, int(args.blank_concurrency)), len(blank_items))
-        + min(max(1, int(args.solution_concurrency)), len(solution_items))
-        + len(extra_objective_items),
-    )
+    remaining_slots = max_workers
+    objective_slots = min(1, remaining_slots) if args.objective_batch_mode and objective_items else 0
+    remaining_slots -= objective_slots
+    extra_objective_slots = min(len(extra_objective_items), remaining_slots)
+    remaining_slots -= extra_objective_slots
+    blank_slots = min(max(1, int(args.blank_concurrency)), len(blank_items), remaining_slots)
+    remaining_slots -= blank_slots
+    solution_slots = min(max(1, int(args.solution_concurrency)), len(solution_items), remaining_slots)
+    if solution_items and solution_slots <= 0:
+        if blank_slots > 1:
+            blank_slots -= 1
+            solution_slots = 1
+        elif extra_objective_slots > 1:
+            extra_objective_slots -= 1
+            solution_slots = 1
+    effective_task_concurrency = min(max_workers, objective_slots + extra_objective_slots + blank_slots + solution_slots)
     estimated_peak_model_calls = effective_task_concurrency * review_multiplier
     append_jsonl(
         audit_log,
@@ -5029,8 +6833,10 @@ def main(argv: list[str]) -> int:
             "question_count": len(parsed_items),
             "grading_task_count": grading_task_count,
             "question_concurrency": max_workers,
-            "blank_concurrency": args.blank_concurrency,
-            "solution_concurrency": args.solution_concurrency,
+            "blank_concurrency": blank_slots,
+            "solution_concurrency": solution_slots,
+            "requested_blank_concurrency": args.blank_concurrency,
+            "requested_solution_concurrency": args.solution_concurrency,
             "single_review": bool(args.single_review),
             "rounds_per_question_parallel": 1 if args.single_review else 2,
             "estimated_peak_model_calls": estimated_peak_model_calls,
@@ -5054,9 +6860,9 @@ def main(argv: list[str]) -> int:
     )
     all_futures: dict[Any, AnswerItem | list[AnswerItem]] = {}
     objective_executor = ThreadPoolExecutor(max_workers=1)
-    blank_executor = ThreadPoolExecutor(max_workers=min(max(1, int(args.blank_concurrency)), max(1, len(blank_items))))
-    solution_executor = ThreadPoolExecutor(max_workers=min(max(1, int(args.solution_concurrency)), max(1, len(solution_items))))
-    extra_objective_executor = ThreadPoolExecutor(max_workers=min(max_workers, max(1, len(extra_objective_items))))
+    blank_executor = ThreadPoolExecutor(max_workers=max(1, blank_slots))
+    solution_executor = ThreadPoolExecutor(max_workers=max(1, solution_slots))
+    extra_objective_executor = ThreadPoolExecutor(max_workers=max(1, extra_objective_slots))
     executors = [objective_executor, blank_executor, solution_executor, extra_objective_executor]
     try:
         if args.objective_batch_mode and objective_items:

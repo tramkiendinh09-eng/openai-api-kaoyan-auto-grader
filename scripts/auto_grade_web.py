@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import html
 import io
 import json
@@ -24,6 +25,7 @@ SCRIPT_PATH = ROOT / "scripts" / "auto_grade_exam.py"
 MINERU_DIR = ROOT / "tmp" / "mineru_grading"
 UPLOAD_DIR = ROOT / "tmp" / "uploads"
 OUTPUT_DIR = ROOT / "output" / "auto_grading"
+SCOREBOOK_DIR = OUTPUT_DIR / "scorebooks"
 DEFAULT_POLICY_PATH = ROOT / "config" / "kaoyan_math_grading_policy.md"
 UPLOAD_ROLES = {"submission", "question_paper", "reference"}
 DEFAULT_USER_AGENT = "Codex Desktop/0.133.0-alpha.1 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 9.41501)"
@@ -72,7 +74,13 @@ def text_response(handler: BaseHTTPRequestHandler, text: str, status: int = 200,
     handler.wfile.write(body)
 
 
-def binary_response(handler: BaseHTTPRequestHandler, body: bytes, filename: str, content_type: str) -> None:
+def binary_response(
+    handler: BaseHTTPRequestHandler,
+    body: bytes,
+    filename: str,
+    content_type: str,
+    extra_headers: dict[str, str] | None = None,
+) -> None:
     safe_ascii_name = re.sub(r"[^A-Za-z0-9_.-]", "_", filename) or "download.bin"
     handler.send_response(HTTPStatus.OK)
     handler.send_header("Content-Type", content_type)
@@ -82,6 +90,8 @@ def binary_response(handler: BaseHTTPRequestHandler, body: bytes, filename: str,
         "Content-Disposition",
         f"attachment; filename=\"{safe_ascii_name}\"; filename*=UTF-8''{quote(filename)}",
     )
+    for key, value in (extra_headers or {}).items():
+        handler.send_header(key, value)
     handler.end_headers()
     handler.wfile.write(body)
 
@@ -293,9 +303,9 @@ def build_grading_command(payload: dict, submission_pdf: Path, run_id: str, cand
     max_retries = int(payload.get("max_retries") or 3)
     timeout_seconds = int(payload.get("timeout_seconds") or 180)
     max_output_tokens = int(payload.get("max_output_tokens") or 100000)
-    concurrency = int(payload.get("concurrency") or 10)
-    blank_concurrency = int(payload.get("blank_concurrency") or 3)
-    solution_concurrency = int(payload.get("solution_concurrency") or 6)
+    concurrency = min(6, max(1, int(payload.get("concurrency") or 6)))
+    blank_concurrency = min(concurrency, max(1, int(payload.get("blank_concurrency") or 2)))
+    solution_concurrency = min(concurrency, max(1, int(payload.get("solution_concurrency") or 3)))
     reference_is_official = bool(payload.get("reference_is_official"))
     strict_official = bool(payload.get("strict_official"))
     policy_path = require_local_path(str(payload.get("policy_path") or str(DEFAULT_POLICY_PATH)))
@@ -565,12 +575,21 @@ def stop_grading_task(run_id: str) -> TaskState:
     state.status = "stopping"
     process = state.process
     if process is not None and process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
+        terminate_process_tree(process.pid)
     return state
+
+
+def terminate_process_tree(pid: int) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        return
+    with contextlib.suppress(Exception):
+        os.kill(pid, 15)
 
 
 def load_report(run_id: str, filename: str) -> object:
@@ -733,12 +752,18 @@ def build_scorebook(run_id: str) -> tuple[bytes, str]:
             "H": 10,
             "I": 10,
             "J": 14,
-            "K": 28,
-            "L": 28,
-            "M": 28,
-            "N": 28,
-            "O": 22,
-            "P": 26,
+            "K": 12,
+            "L": 12,
+            "M": 12,
+            "N": 12,
+            "O": 18,
+            "P": 32,
+            "Q": 28,
+            "R": 28,
+            "S": 28,
+            "T": 28,
+            "U": 22,
+            "V": 26,
         }
         for col, width in widths.items():
             ws.column_dimensions[col].width = width
@@ -793,7 +818,7 @@ def build_scorebook(run_id: str) -> tuple[bytes, str]:
         for key_cell in ("A2", "A3", "A4", "D2", "D3", "D4", "G2", "G3", "G4"):
             ws[key_cell].font = Font(bold=True, color="374151")
         for row_no in range(2, 5):
-            for col_no in range(1, 17):
+            for col_no in range(1, 18):
                 ws.cell(row=row_no, column=col_no).alignment = wrap
 
         headers = [
@@ -807,6 +832,12 @@ def build_scorebook(run_id: str) -> tuple[bytes, str]:
             "需人工复核",
             "置信度",
             "评分引擎",
+            "A轮定位",
+            "B轮复核",
+            "B轮失败",
+            "单题视觉",
+            "证据状态",
+            "证据原因",
             "识别作答",
             "主要得分点",
             "主要扣分点/原因",
@@ -822,6 +853,7 @@ def build_scorebook(run_id: str) -> tuple[bytes, str]:
                 continue
             source = row.get("student_answer_source") if isinstance(row.get("student_answer_source"), dict) else {}
             visual_sources = row.get("visual_sources") if isinstance(row.get("visual_sources"), dict) else {}
+            evidence_state = row.get("evidence_state") if isinstance(row.get("evidence_state"), dict) else {}
             final_score = score_text(row.get("final_score"))
             excel_row = [
                 text_for_excel(row.get("question_no"), 80),
@@ -834,6 +866,12 @@ def build_scorebook(run_id: str) -> tuple[bytes, str]:
                 "是" if row.get("needs_human_review") else "否",
                 numeric_score(row.get("confidence")),
                 text_for_excel(row.get("scoring_engine") or row.get("evidence_used"), 180),
+                "是" if evidence_state.get("a_round_found") else "否",
+                "是" if evidence_state.get("b_round_verified") else "否",
+                "是" if evidence_state.get("b_round_failed") else "否",
+                "是" if evidence_state.get("single_focus_verified") else "否",
+                text_for_excel(evidence_state.get("status") or "", 120),
+                text_for_excel(evidence_state.get("reasons") or [], 1000),
                 text_for_excel(
                     row.get("recognized_student_answer")
                     or source.get("recognized_student_answer")
@@ -916,6 +954,23 @@ def build_scorebook(run_id: str) -> tuple[bytes, str]:
     return output.getvalue(), filename
 
 
+def scorebook_path_for(filename: str) -> Path:
+    safe_name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", filename).strip().strip(".")
+    if not safe_name:
+        safe_name = "得分表.xlsx"
+    if not safe_name.lower().endswith(".xlsx"):
+        safe_name += ".xlsx"
+    return SCOREBOOK_DIR / safe_name
+
+
+def save_scorebook(run_id: str) -> tuple[bytes, str, Path]:
+    body, filename = build_scorebook(run_id)
+    SCOREBOOK_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = scorebook_path_for(filename)
+    output_path.write_bytes(body)
+    return body, filename, output_path
+
+
 def load_audit_tail(run_id: str) -> dict:
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", run_id):
         raise ValueError("bad run id")
@@ -944,7 +999,7 @@ def audit_progress(events: list[dict]) -> dict:
     latest_event = None
     latest_elapsed = None
     latest_error = None
-    layout_scan_status = "双xhigh视觉小格定位：尚未看到日志"
+    layout_scan_status = "视觉定位：尚未看到日志"
     successful_calls = 0
     failed_calls = 0
     active_calls = 0
@@ -955,21 +1010,51 @@ def audit_progress(events: list[dict]) -> dict:
             continue
         name = event.get("event")
         if name == "answer_layout_scan_started":
-            layout_scan_status = "双xhigh视觉小格定位：已发起"
+            layout_scan_status = f"视觉定位：A轮分页扫描已发起，{event.get('page_count', 0)} 页 / {event.get('layout_chunk_count', 0)} 块，A轮并发 {event.get('a_round_parallel_chunks', 1)}"
+        elif name == "answer_layout_scan_chunk_dispatch_started":
+            layout_scan_status = f"视觉定位：{event.get('round', '')}轮 {event.get('total_chunks', 0)} 块已派发，并发 {event.get('parallelism', 1)}"
+        elif name == "answer_layout_scan_chunk_started":
+            layout_scan_status = f"视觉定位：{event.get('round', '')}轮第 {event.get('chunk_index', '')}/{event.get('total_chunks', '')} 块，页 {event.get('page_numbers', [])}"
+        elif name == "answer_layout_scan_chunk_finished":
+            layout_scan_status = f"视觉定位：{event.get('round', '')}轮第 {event.get('chunk_index', '')}/{event.get('total_chunks', '')} 块完成，定位 {event.get('located_question_count', 0)} 题"
+        elif name == "answer_layout_scan_chunk_failed":
+            layout_scan_status = f"视觉定位：{event.get('round', '')}轮第 {event.get('chunk_index', '')} 块失败"
+        elif name == "answer_layout_scan_missing_chunks_retry_started":
+            layout_scan_status = f"视觉定位：失败页块开始 high 兜底重扫，{len(event.get('missing_chunks') or [])} 块"
+        elif name == "answer_layout_scan_retry_chunk_finished":
+            layout_scan_status = f"视觉定位：第 {event.get('chunk_index', '')} 块 high 兜底完成，定位 {event.get('located_question_count', 0)} 题"
+        elif name == "answer_layout_scan_coverage_failed":
+            layout_scan_status = f"视觉定位：覆盖校验失败，缺页 {event.get('missing_pages', [])}"
+        elif name == "answer_layout_scan_b_group_dispatch_started":
+            layout_scan_status = f"视觉定位：B轮按A轮定位分 {event.get('group_count', 0)} 组复核，并发 {event.get('parallelism', 1)}"
+        elif name == "answer_layout_scan_b_group_started":
+            layout_scan_status = f"视觉定位：B轮第 {event.get('group_index', '')}/{event.get('total_groups', '')} 组，题 {event.get('question_nos', [])}"
+        elif name == "answer_layout_scan_b_group_finished":
+            layout_scan_status = f"视觉定位：B轮第 {event.get('group_index', '')}/{event.get('total_groups', '')} 组完成，差异 {event.get('delta_question_count', 0)} 题"
+        elif name == "answer_layout_scan_b_group_failed":
+            layout_scan_status = f"视觉定位：B轮第 {event.get('group_index', '')} 组失败，正在拆小重试"
+        elif name == "answer_layout_scan_b_retry_dispatch_started":
+            layout_scan_status = f"视觉定位：B轮失败组已拆成 {event.get('retry_group_count', 0)} 个小组重试"
+        elif name == "answer_layout_scan_b_retry_group_started":
+            layout_scan_status = f"视觉定位：B轮拆小重试第 {event.get('group_index', '')} 组，题 {event.get('question_nos', [])}"
+        elif name == "answer_layout_scan_b_retry_group_finished":
+            layout_scan_status = f"视觉定位：B轮拆小重试第 {event.get('group_index', '')} 组完成"
+        elif name == "answer_layout_scan_b_question_verification_failed":
+            layout_scan_status = f"视觉定位：B轮仍未覆盖题 {event.get('question_nos', [])}，已转人工复核保护"
         elif name == "answer_layout_scan_finished":
-            layout_scan_status = f"双xhigh视觉小格定位：已完成，定位 {event.get('located_question_count', 0)} 题，答案串 {event.get('objective_answer_run_count', 0)} 组"
+            layout_scan_status = f"视觉定位：A轮全页+B轮分组复核完成，定位 {event.get('located_question_count', 0)} 题，答案串 {event.get('objective_answer_run_count', 0)} 组"
             if event.get("round_errors"):
-                layout_scan_status += "，其中一路失败已兜底"
+                layout_scan_status += "，有失败记录请复核"
         elif name == "answer_layout_scan_round_failed":
-            layout_scan_status = f"双xhigh视觉小格定位：{event.get('round', '')} 路失败，等待另一路或兜底"
+            layout_scan_status = f"视觉定位：{event.get('round', '')} 轮未完整覆盖，等待兜底"
         elif name == "answer_layout_scan_compact_fallback_started":
-            layout_scan_status = "双xhigh视觉小格定位：双路超时，已启动紧凑high兜底"
+            layout_scan_status = "视觉定位：A/B未完整覆盖，已启动全页分块紧凑high兜底"
         elif name == "answer_layout_scan_compact_fallback_finished":
-            layout_scan_status = f"紧凑high视觉定位：已完成，定位 {event.get('located_question_count', 0)} 题，答案串 {event.get('objective_answer_run_count', 0)} 组"
+            layout_scan_status = f"全页分块紧凑high定位：已完成，定位 {event.get('located_question_count', 0)} 题，答案串 {event.get('objective_answer_run_count', 0)} 组"
         elif name == "answer_layout_scan_compact_fallback_failed":
-            layout_scan_status = "紧凑high视觉定位：失败，已改用页码启发式"
+            layout_scan_status = "全页分块紧凑high定位：失败，已改用人工复核保护"
         elif name == "answer_layout_scan_failed":
-            layout_scan_status = "双xhigh视觉小格定位：失败，已改用页码启发式"
+            layout_scan_status = "视觉定位：失败，已改用人工复核保护"
         if name in {"visual_evidence_attached", "local_objective_grade"} and event.get("question_no"):
             latest_question = str(event.get("question_no"))
             latest_round = "准备视觉阅卷" if name == "visual_evidence_attached" else "本地客观题判分"
@@ -988,42 +1073,114 @@ def audit_progress(events: list[dict]) -> dict:
             latest_event = name
         elif name == "answer_layout_scan_started":
             latest_question = "整卷"
-            latest_round = "双xhigh视觉小格定位已发起"
+            latest_round = f"A轮分页视觉定位已发起，{event.get('page_count', 0)} 页 / {event.get('layout_chunk_count', 0)} 块"
+            latest_event = name
+        elif name == "answer_layout_scan_chunk_dispatch_started":
+            latest_question = "整卷"
+            latest_round = f"{event.get('round', '')}轮页块并发扫描已派发，并发 {event.get('parallelism', 1)}"
+            latest_event = name
+        elif name == "answer_layout_scan_chunk_started":
+            latest_question = "整卷"
+            latest_round = f"{event.get('round', '')}轮第 {event.get('chunk_index', '')}/{event.get('total_chunks', '')} 块扫描页 {event.get('page_numbers', [])}"
+            latest_event = name
+        elif name == "answer_layout_scan_chunk_finished":
+            latest_question = "整卷"
+            latest_round = f"{event.get('round', '')}轮第 {event.get('chunk_index', '')}/{event.get('total_chunks', '')} 块完成"
+            latest_event = name
+        elif name == "answer_layout_scan_chunk_failed":
+            latest_question = "整卷"
+            latest_round = f"{event.get('round', '')}轮第 {event.get('chunk_index', '')} 块失败"
+            latest_event = name
+            latest_error = str(event.get("error") or "")
+        elif name == "answer_layout_scan_b_group_dispatch_started":
+            latest_question = "整卷"
+            latest_round = f"B轮按A轮定位自动分 {event.get('group_count', 0)} 组并发复核"
+            latest_event = name
+        elif name == "answer_layout_scan_b_group_started":
+            latest_question = "整卷"
+            latest_round = f"B轮第 {event.get('group_index', '')}/{event.get('total_groups', '')} 组复核题 {event.get('question_nos', [])}"
+            latest_event = name
+        elif name == "answer_layout_scan_b_group_finished":
+            latest_question = "整卷"
+            latest_round = f"B轮第 {event.get('group_index', '')}/{event.get('total_groups', '')} 组完成，差异 {event.get('delta_question_count', 0)} 题"
+            latest_event = name
+        elif name == "answer_layout_scan_b_group_failed":
+            latest_question = "整卷"
+            latest_round = f"B轮第 {event.get('group_index', '')} 组失败，其他组继续"
+            latest_event = name
+            latest_error = str(event.get("error") or "")
+        elif name == "answer_layout_scan_b_retry_dispatch_started":
+            latest_question = "整卷"
+            latest_round = f"B轮失败组拆成 {event.get('retry_group_count', 0)} 个小组重试"
+            latest_event = name
+        elif name == "answer_layout_scan_b_retry_group_started":
+            latest_question = "整卷"
+            latest_round = f"B轮拆小重试第 {event.get('group_index', '')} 组，题 {event.get('question_nos', [])}"
+            latest_event = name
+        elif name == "answer_layout_scan_b_retry_group_finished":
+            latest_question = "整卷"
+            latest_round = f"B轮拆小重试第 {event.get('group_index', '')} 组完成"
+            latest_event = name
+        elif name == "answer_layout_scan_b_retry_group_failed":
+            latest_question = "整卷"
+            latest_round = f"B轮拆小重试第 {event.get('group_index', '')} 组失败"
+            latest_event = name
+            latest_error = str(event.get("error") or "")
+        elif name == "answer_layout_scan_b_question_verification_failed":
+            latest_question = "整卷"
+            latest_round = f"B轮仍未覆盖题 {event.get('question_nos', [])}，已标记证据风险"
+            latest_event = name
+        elif name == "answer_layout_scan_b_group_partial_failed":
+            latest_question = "整卷"
+            latest_round = f"B轮分组复核部分失败，已完成 {event.get('completed_group_count', 0)}/{event.get('total_groups', 0)} 组"
             latest_event = name
         elif name == "answer_layout_scan_finished":
             latest_question = "整卷"
-            latest_round = f"双xhigh视觉小格定位完成，定位 {event.get('located_question_count', 0)} 题"
+            latest_round = f"A轮全页+B轮分组复核完成，定位 {event.get('located_question_count', 0)} 题"
             latest_event = name
         elif name == "answer_layout_scan_round_failed":
             latest_question = "整卷"
-            latest_round = f"双xhigh视觉小格定位 {event.get('round', '')} 路失败"
+            latest_round = f"视觉定位 {event.get('round', '')} 轮未完整覆盖"
             latest_event = name
             latest_error = str(event.get("error") or "")
+        elif name == "answer_layout_scan_missing_chunks_retry_started":
+            latest_question = "整卷"
+            latest_round = f"失败页块 high 兜底重扫已发起，{len(event.get('missing_chunks') or [])} 块"
+            latest_event = name
+        elif name == "answer_layout_scan_retry_chunk_finished":
+            latest_question = "整卷"
+            latest_round = f"第 {event.get('chunk_index', '')} 块 high 兜底重扫完成"
+            latest_event = name
         elif name == "answer_layout_scan_compact_fallback_started":
             latest_question = "整卷"
-            latest_round = "紧凑high视觉定位兜底已发起"
+            latest_round = "全页分块紧凑high定位兜底已发起"
             latest_event = name
         elif name == "answer_layout_scan_compact_fallback_finished":
             latest_question = "整卷"
-            latest_round = f"紧凑high视觉定位完成，定位 {event.get('located_question_count', 0)} 题"
+            latest_round = f"全页分块紧凑high定位完成，定位 {event.get('located_question_count', 0)} 题"
             latest_event = name
         elif name == "answer_layout_scan_compact_fallback_failed":
             latest_question = "整卷"
-            latest_round = "紧凑high视觉定位失败，改用旧的页码启发式"
+            latest_round = "全页分块紧凑high定位失败，改用人工复核保护"
             latest_event = name
             latest_error = str(event.get("error") or "")
         elif name == "answer_layout_scan_failed":
             latest_question = "整卷"
-            latest_round = "双xhigh视觉小格定位失败，改用旧的页码启发式"
+            latest_round = "视觉定位失败，改用人工复核保护"
             latest_event = name
             latest_error = str(event.get("error") or "")
+        elif name == "answer_layout_scan_b_round_degraded_to_a":
+            latest_question = "整卷"
+            latest_round = "B轮复核断流，已采用A轮完整定位继续阅卷"
+            latest_event = name
+            latest_error = ""
         elif name in {"model_cache_hit"}:
             call_name = str(event.get("call_name") or "")
             match = re.search(r"q(\d+)_(?:round(\d+)|single)", call_name)
             latest_question = match.group(1) if match else ("整卷" if call_name == "answer_layout_scan" else "1-10" if call_name.startswith("objective_batch_") else latest_question)
             latest_round = "模型响应缓存命中"
             latest_event = name
-        elif name in {"model_call_started", "model_call", "model_call_error"}:
+        elif name in {"model_call_started", "model_call", "model_call_error", "model_call_partial_stream_recovered"}:
             call_name = str(event.get("call_name") or "")
             if call_name:
                 model_tasks.add(call_name)
@@ -1034,7 +1191,9 @@ def audit_progress(events: list[dict]) -> dict:
             if name == "model_call_started":
                 active_calls += 1
             else:
-                if name == "model_call" and as_int(event.get("status_code")) < 400:
+                if name == "model_call_partial_stream_recovered":
+                    successful_calls += 1
+                elif name == "model_call" and as_int(event.get("status_code")) < 400:
                     successful_calls += 1
                 else:
                     failed_calls += 1
@@ -1057,7 +1216,7 @@ def audit_progress(events: list[dict]) -> dict:
                     latest_round += "已发起"
             elif call_name.startswith("answer_layout_scan"):
                 latest_question = "整卷"
-                latest_round = "双xhigh视觉小格定位"
+                latest_round = "视觉定位扫描"
                 if name == "model_call_started":
                     latest_round += "已发起"
             latest_event = name
@@ -1067,6 +1226,9 @@ def audit_progress(events: list[dict]) -> dict:
                 latest_round = (latest_round or "模型调用") + f"（首包 {event.get('header_elapsed_seconds')}s）"
             if event.get("error"):
                 latest_error = str(event.get("error"))
+            if name == "model_call_partial_stream_recovered":
+                latest_round = (latest_round or "模型调用") + "（断流后已从完整JSON恢复）"
+                latest_error = ""
     text = "等待任务开始"
     if latest_question:
         text = f"最近处理第 {latest_question} 题"
@@ -1198,12 +1360,16 @@ class Handler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/scorebook":
                 query = parse_qs(parsed.query)
                 run_id = query.get("run_id", [""])[0]
-                body, filename = build_scorebook(run_id)
+                body, filename, output_path = save_scorebook(run_id)
                 binary_response(
                     self,
                     body,
                     filename,
                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    {
+                        "X-Scorebook-Path": quote(str(output_path), safe=""),
+                        "X-Scorebook-Name": quote(filename, safe=""),
+                    },
                 )
             elif parsed.path == "/api/audit":
                 query = parse_qs(parsed.query)
@@ -1618,7 +1784,7 @@ INDEX_HTML = r"""<!doctype html>
         </div>
       </div>
       <label for="apiUrl">API URL</label>
-      <input id="apiUrl" value="" placeholder="例如 https://your-gateway.example.com/v1" />
+      <input id="apiUrl" value="" placeholder="例如 https://your-gateway.example.com/v1；可用逗号/换行填多个备用端点" />
       <label for="userAgent">请求头 User-Agent</label>
       <input id="userAgent" value="Codex Desktop/0.133.0-alpha.1 (Windows 10.0.19045; x86_64) unknown (Codex Desktop; 9.41501)" />
       <label for="apiMode">调用方式</label>
@@ -1657,7 +1823,7 @@ INDEX_HTML = r"""<!doctype html>
           </select>
         </div>
       </div>
-      <div class="hint">默认先用 2 次 xhigh 视觉并行总览，切出选择题答案串、填空小格和大题作答框；后续每题用 high 结合 MinerU OCR 与局部视觉图阅卷。</div>
+      <div class="hint">默认先用 A 轮 xhigh 分页扫描完整 PDF，再用 B 轮按 A 轮题号分组复核；每页都必须覆盖，长大题允许跨多页合并，后续每题用 high 结合 MinerU OCR 与局部视觉图阅卷。</div>
       <label for="apiKey">API Key</label>
       <input id="apiKey" type="password" placeholder="只在本地进程中用于本次调用，不写入文件" />
       <label for="policyPath">全局阅卷规范</label>
@@ -1686,7 +1852,7 @@ INDEX_HTML = r"""<!doctype html>
       <label for="maxOutputTokens">单次最大输出 tokens</label>
       <input id="maxOutputTokens" type="number" value="100000" min="200" max="200000" />
       <label for="concurrency">题目并发数</label>
-      <input id="concurrency" type="number" value="5" min="1" max="10" />
+      <input id="concurrency" type="number" value="6" min="1" max="6" />
       <div class="row">
         <div>
           <label for="blankConcurrency">填空并发</label>
@@ -1725,6 +1891,7 @@ INDEX_HTML = r"""<!doctype html>
         <div>
           <h2>运行结果</h2>
           <div id="runId" class="hint run-path"></div>
+          <div id="scorebookPath" class="hint run-path"></div>
         </div>
         <div class="result-actions">
           <button id="downloadScorebookBtn" class="secondary" disabled>下载得分表</button>
@@ -1737,7 +1904,7 @@ INDEX_HTML = r"""<!doctype html>
         <div class="metric"><strong id="reviewCount">-</strong><span>需复核</span></div>
         <div class="metric"><strong id="arbCount">-</strong><span>仲裁次数</span></div>
       </div>
-      <div id="progressBox" class="progress-box">双xhigh视觉小格定位：等待开始。等待任务开始</div>
+      <div id="progressBox" class="progress-box">视觉定位：等待开始。等待任务开始</div>
       <div id="summary"></div>
       <div class="tabs">
         <button class="active" data-tab="table">得分表</button>
@@ -1798,6 +1965,7 @@ INDEX_HTML = r"""<!doctype html>
       const btn = $("downloadScorebookBtn");
       btn.disabled = !enabled || !scorebookRunId;
       btn.textContent = scorebookRunId ? "下载得分表" : "等待得分表";
+      if (!scorebookRunId) $("scorebookPath").textContent = "";
     }
 
     async function loadFiles() {
@@ -1983,7 +2151,7 @@ INDEX_HTML = r"""<!doctype html>
         timeout_seconds: Number($("timeout").value || 300),
         max_retries: Number($("retries").value || 3),
         max_output_tokens: Number($("maxOutputTokens").value || 100000),
-        concurrency: Number($("concurrency").value || 10),
+        concurrency: Number($("concurrency").value || 6),
         blank_concurrency: Number($("blankConcurrency").value || 2),
         solution_concurrency: Number($("solutionConcurrency").value || 3),
         parse_only: $("parseOnly").checked,
@@ -2098,6 +2266,7 @@ INDEX_HTML = r"""<!doctype html>
         const blob = await res.blob();
         const disposition = res.headers.get("Content-Disposition") || "";
         const filename = scorebookFilename(disposition, targetRunId);
+        const serverPath = decodeHeaderValue(res.headers.get("X-Scorebook-Path") || "");
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
         link.href = url;
@@ -2106,6 +2275,9 @@ INDEX_HTML = r"""<!doctype html>
         link.click();
         link.remove();
         URL.revokeObjectURL(url);
+        $("scorebookPath").textContent = serverPath
+          ? `项目内得分表：${serverPath}`
+          : `已生成得分表：${filename}`;
       } catch (err) {
         alert("得分表导出失败：" + err);
       } finally {
@@ -2121,6 +2293,11 @@ INDEX_HTML = r"""<!doctype html>
       }
       const asciiMatch = disposition.match(/filename="?([^";]+)"?/i);
       return asciiMatch ? asciiMatch[1] : `得分表_${runId}.xlsx`;
+    }
+
+    function decodeHeaderValue(value) {
+      if (!value) return "";
+      try { return decodeURIComponent(value); } catch (_) { return value; }
     }
 
     function renderReport(report) {
@@ -2139,7 +2316,7 @@ INDEX_HTML = r"""<!doctype html>
       const completed = report.completed_question_count ?? report.score_summary?.graded_question_count ?? (report.question_scores || []).length ?? 0;
       const total = report.total_question_count ?? "";
       const text = audit.progress?.text || "等待任务开始";
-      const layoutText = audit.progress?.layout_scan_status || "双xhigh视觉小格定位：等待开始";
+      const layoutText = audit.progress?.layout_scan_status || "视觉定位：等待开始";
       const countText = total ? `已完成 ${completed}/${total} 题。` : "";
       $("progressBox").textContent = `${layoutText}。${countText}${text}`;
     }
@@ -2163,6 +2340,13 @@ INDEX_HTML = r"""<!doctype html>
         const recognized = source.recognized_student_answer || row.recognized_student_answer || row.grading_round_1?.recognized_student_answer || row.grading_round_1?.student_choice || "";
         const visualSummary = source.visual_reading_summary || row.visual_reading_summary || row.grading_round_1?.visual_reading_summary || "";
         const evidenceUsed = source.evidence_used || row.evidence_used || row.grading_round_1?.evidence_used || "";
+        const evidenceState = row.evidence_state || {};
+        const evidenceBits = [
+          evidenceState.a_round_found ? "A定位" : "A未定位",
+          evidenceState.b_round_failed ? "B失败" : (evidenceState.b_round_verified ? "B已核" : "B未核"),
+          evidenceState.single_focus_verified ? "单题裁剪" : "无单题裁剪",
+          evidenceState.status || ""
+        ].filter(Boolean).join(" / ");
         const ocrDraft = source.student_answer_ocr || "";
         html += `<tr>
           <td>${escapeHtml(row.question_no)}</td>
@@ -2171,6 +2355,8 @@ INDEX_HTML = r"""<!doctype html>
           <td>
             <div>${escapeHtml(compactCell(recognized || "未形成视觉复核文本"))}</div>
             <div class="hint">${escapeHtml(compactCell(visualSummary))}</div>
+            <div class="hint">${escapeHtml(evidenceBits ? "状态：" + evidenceBits : "")}</div>
+            <div class="hint">${escapeHtml((evidenceState.reasons || []).length ? "证据原因：" + compactCell((evidenceState.reasons || []).join("；")) : "")}</div>
             <div class="hint">${escapeHtml(evidenceUsed ? "证据：" + evidenceUsed : "")}</div>
             <div class="hint">${escapeHtml(ocrDraft ? "MinerU草稿：" + compactCell(ocrDraft) : "")}</div>
           </td>
